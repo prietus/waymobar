@@ -1,0 +1,67 @@
+cabal-version:      3.0
+name:               waymobar
+version:            0.1.0.0
+synopsis:           A Wayland status bar written and configured in Haskell
+description:
+  waymobar is a status bar for Wayland compositors with wlr-layer-shell,
+  in the spirit of xmobar: configured with a Haskell file, with native
+  widgets for rivermonad (workspaces, layout, window title) read from its
+  IPC socket. The Wayland protocol is implemented in pure Haskell; text is
+  drawn with cairo and pango.
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             prietus
+maintainer:         prietus@live.com
+category:           System
+build-type:         Simple
+extra-doc-files:    README.md
+data-files:         examples/waymobar.hs
+extra-source-files: protocol/*.xml, tools/gen-protocol.py, tools/regen.sh
+
+common warnings
+  ghc-options: -Wall -Wno-name-shadowing
+
+library
+  import:           warnings
+  hs-source-dirs:   src
+  default-language: GHC2021
+  default-extensions: LambdaCase
+  exposed-modules:
+    Waymobar
+    Waymobar.Bar
+    Waymobar.Config
+    Waymobar.Core
+    Waymobar.DBus
+    Waymobar.Draw
+    Waymobar.Icons
+    Waymobar.JSON
+    Waymobar.Main
+    Waymobar.Recompile
+    Waymobar.Rivermonad
+    Waymobar.Tray
+    Waymobar.Widgets
+    Waymobar.Wayland.Protocol
+    Waymobar.Wayland.Wire
+  c-sources:        cbits/waymobar.c, cbits/icons.c
+  pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0
+  build-depends:
+      base        >=4.16 && <5
+    , binary      >=0.8  && <0.11
+    , bytestring  >=0.11 && <0.13
+    , containers  >=0.6  && <0.8
+    , directory   >=1.3  && <1.4
+    , filepath    >=1.4  && <1.6
+    , network     >=3.1  && <3.3
+    , process     >=1.6  && <1.7
+    , stm         >=2.5  && <2.6
+    , text        >=2.0  && <2.2
+    , time        >=1.9  && <1.15
+    , unix        >=2.7  && <2.9
+
+executable waymobar
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: GHC2021
+  ghc-options:      -threaded -rtsopts
+  build-depends:    base, waymobar
