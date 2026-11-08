@@ -1,9 +1,17 @@
 # waymobar
 
 A status bar for Wayland, written and configured in Haskell, in the spirit of
-xmobar. It is the native bar for [rivermonad](../README.md): workspaces,
-layout and window title come straight from rivermonad's IPC socket, and
-clicking them acts on rivermonad.
+xmobar. It is the native bar for [rivermonad](https://github.com/prietus/rivermonad):
+workspaces, layout and window title come straight from rivermonad's IPC
+socket, and clicking them acts on rivermonad.
+
+![waymobar with the pill theme: workspaces, layout, window title, media, network, volume, CPU, memory, clock and log out](docs/bar.png)
+
+![Clicking workspaces and cycling layouts from the bar](docs/bar.gif)
+
+*The pill theme from the [example dotfiles](https://github.com/prietus/rivermonad/tree/main/examples/dotfiles)
+at scale 2: hover highlights, workspaces and layouts switched by clicking.
+See it in a whole desktop in [rivermonad's demo](https://github.com/prietus/rivermonad#rivermonad).*
 
 * pure-Haskell Wayland client (`Waymobar.Wayland.Wire`, bindings generated
   from the XML in `protocol/`); text is drawn with cairo + pango through a
