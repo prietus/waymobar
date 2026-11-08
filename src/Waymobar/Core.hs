@@ -19,6 +19,7 @@ module Waymobar.Core
   , IconSource (..)
   , Style (..)
   , noStyle
+  , mergeStyle
   , styled
   ) where
 
@@ -42,7 +43,9 @@ data Config = Config
     -- ^ space around the bar (top, right, bottom, left), in logical pixels.
     -- Match rivermonad's outer gap to line the bar up with the windows,
     -- e.g. @(1, 1, 0, 1)@ with @gapsWithEdge 1@.
-  , bgColor       :: String    -- ^ @#rrggbb@ or @#rrggbbaa@
+  , bgColor       :: String    -- ^ @#rrggbb@ or @#rrggbbaa@ (transparent bars work)
+  , barRadius     :: Double    -- ^ rounded corners of the bar
+  , barBorder     :: Maybe (Double, String)  -- ^ width and colour of a border around the bar
   , fgColor       :: String
   , left          :: [Widget]
   , center        :: [Widget]
@@ -64,6 +67,8 @@ defaultConfig = Config
   , layer = TopLayer
   , exclusive = True
   , margins = (0, 0, 0, 0)
+  , barRadius = 0
+  , barBorder = Nothing
   , bgColor = "#2e3440"
   , fgColor = "#d8dee9"
   , left = []
@@ -105,16 +110,42 @@ data MenuEntry
 menuItem :: String -> IO () -> MenuEntry
 menuItem l = MenuItem l True Nothing Nothing
 
--- | Colours of a block; 'Nothing' keeps the bar's.
+-- | How a block (or, with 'Waymobar.Widgets.groupStyle', a whole widget)
+-- looks. Every field is optional: 'Nothing' keeps the bar's look, and
+-- 'mergeStyle' layers one style over another.
 data Style = Style
-  { styleFg        :: Maybe String
-  , styleBg        :: Maybe String
-  , styleUnderline :: Maybe String  -- ^ a line at the bottom edge
-  , styleOverline  :: Maybe String  -- ^ a line at the top edge
+  { styleFg        :: Maybe String            -- ^ text colour
+  , styleBg        :: Maybe String            -- ^ background of the box
+  , styleUnderline :: Maybe String            -- ^ a 2 px line at the bottom of the box
+  , styleOverline  :: Maybe String            -- ^ a 2 px line at the top of the box
+  , styleRadius    :: Maybe Double            -- ^ rounded corners of the box (CSS border-radius)
+  , styleBorder    :: Maybe (Double, String)  -- ^ width and colour of a border around the box
+  , styleMargin    :: Maybe (Double, Double)  -- ^ (vertical, horizontal) space around the box (CSS margin)
+  , stylePadding   :: Maybe Double            -- ^ extra horizontal space inside the box (CSS padding)
+  , styleHover     :: Maybe Style             -- ^ merged over this style while the pointer is on it
   } deriving (Eq, Show)
 
 noStyle :: Style
-noStyle = Style Nothing Nothing Nothing Nothing
+noStyle = Style Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+
+-- | @mergeStyle top base@: the fields set in @top@ win.
+mergeStyle :: Style -> Style -> Style
+mergeStyle t b = Style
+  { styleFg = styleFg t `orElse` styleFg b
+  , styleBg = styleBg t `orElse` styleBg b
+  , styleUnderline = styleUnderline t `orElse` styleUnderline b
+  , styleOverline = styleOverline t `orElse` styleOverline b
+  , styleRadius = styleRadius t `orElse` styleRadius b
+  , styleBorder = styleBorder t `orElse` styleBorder b
+  , styleMargin = styleMargin t `orElse` styleMargin b
+  , stylePadding = stylePadding t `orElse` stylePadding b
+  , styleHover = case (styleHover t, styleHover b) of
+      (Just x, Just y) -> Just (mergeStyle x y)
+      (x, y) -> x `orElse` y
+  }
+  where
+    orElse (Just x) _ = Just x
+    orElse Nothing y = y
 
 -- | Where an icon comes from. It is rasterized when the bar is drawn, at
 -- the output's real pixel size, so SVGs stay sharp at any scale.
@@ -136,11 +167,12 @@ data Block = Block
   , blockIconSource     :: Maybe IconSource  -- ^ preferred over 'blockIcon' when it loads
   , blockIconColor      :: Maybe String      -- ^ colour for symbolic icons; 'Nothing' = the text colour
   , blockIconRecolorAll :: Bool              -- ^ recolour every icon, not only @-symbolic@ ones
+  , blockGroupStyle     :: Maybe Style       -- ^ a box behind all the blocks of the widget (from its first block)
   }
 
 -- | A block showing some markup, without padding or click handler.
 block :: String -> Block
-block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False
+block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False Nothing
 
 styled :: Style -> Block -> Block
 styled s b = b { blockStyle = s }

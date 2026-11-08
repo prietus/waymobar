@@ -100,6 +100,8 @@ data Bar = Bar
   , bOutput     :: ObjectId
   , bOutputName :: String
   , bHits       :: [(Double, Double, Click -> IO ())]
+  , bHoverX     :: Maybe Double                -- ^ pointer position, for hover styles
+  , bHoverRects :: [(Double, Double)]          -- ^ blocks that have a hover style
   }
 
 -- | A row of an open menu.
@@ -380,8 +382,8 @@ redrawDirty env = do
         h = fromIntegral (sfH sf)
     case (M.lookup surf (sBars s), sPopup s) of
       (Just b, _) -> do
-        hits <- present env sf $ \cv -> paintBar env cv (bOutputName b) w h
-        forM_ hits $ \hs -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs }) surf (sBars s') }
+        res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) w h
+        forM_ res $ \(hs, hr) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr }) surf (sBars s') }
       (_, Just p) | pSurface p == surf -> void $ present env sf $ \cv -> paintMenu env cv p w h
       _ -> pure ()
 
@@ -467,7 +469,7 @@ createBar env o out = do
     wlSurfaceCommit c surf
     modifyIORef' st $ \s -> s
       { sSurfs = M.insert surf sf { sfH = eHeight env } (sSurfs s)
-      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) []) (sBars s)
+      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing []) (sBars s)
       , sOutputs = M.adjust (\x -> x { oBar = Just surf }) o (sOutputs s) }
   where
     c = eConn env
@@ -491,24 +493,29 @@ destroyBar env b = do
 ------------------------------------------------------------------------------
 -- Drawing bars
 
--- | Draw a bar and return its click areas.
-paintBar :: Env -> Canvas -> Output -> Double -> Double -> IO [(Double, Double, Click -> IO ())]
-paintBar env cv out w h = do
+-- | Draw a bar; returns its click areas and the areas with a hover style.
+paintBar :: Env -> Canvas -> Output -> Maybe Double -> Double -> Double
+         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)])
+paintBar env cv out hoverX w h = do
   let cfg = eCfg env
       (ls, cs, rs) = eWidgets env
       hasIcon b = isJust (blockIcon b) || isJust (blockIconSource b)
       visible b = not (null (blockMarkup b)) || hasIcon b
       -- widgets with nothing to show take no room (nor spacing)
       blocksOf = fmap (filter (not . null)) . mapM (\f -> filter visible <$> safe (f out))
-  clear cv (color (bgColor cfg))
+  -- the bar itself: transparent outside its (possibly rounded) box
+  clear cv (Color 0 0 0 0)
+  setColor cv (color (bgColor cfg))
+  fillRounded cv 0 0 w h (barRadius cfg)
+  forM_ (barBorder cfg) $ \(bw, bc) -> setColor cv (color bc) >> strokeRounded cv 0 0 w h (barRadius cfg) bw
   devScale <- canvasScale cv
   let -- Icons with a source are rasterized at the real (device) size, so
       -- SVGs stay sharp at any output scale; the bitmap is a fallback.
-      blockBitmap b isz = case blockIconSource b of
+      blockBitmap b st isz = case blockIconSource b of
         Nothing -> pure (blockIcon b)
         Just src -> do
           let px = max 1 (round (isz * devScale))
-              Color r g bl _ = color (fromMaybe (fromMaybe (fgColor cfg) (styleFg (blockStyle b))) (blockIconColor b))
+              Color r g bl _ = color (fromMaybe (fromMaybe (fgColor cfg) (styleFg st)) (blockIconColor b))
           ic <- resolveIcon src px (Just (r, g, bl)) (blockIconRecolorAll b)
           pure (maybe (blockIcon b) Just ic)
   lb <- blocksOf ls
@@ -522,34 +529,76 @@ paintBar env cv out w h = do
         measure bss k = withLayouts cv fnt (map blockMarkup (concat bss)) $ \lays -> do
           ws <- forM (zip (concat bss) lays) $ \(b, l) -> do
             (tw, th) <- layoutSize l
-            let textW = if null (blockMarkup b) then 0 else fromIntegral tw
-            pure (max (fromIntegral (blockMinWidth b)) (iconPart b + textW + 2 * fromIntegral (blockPadding b)), th)
+            let st = blockStyle b
+                (_, mh) = boxMargin st
+                textW = if null (blockMarkup b) then 0 else fromIntegral tw
+                inner = iconPart b + textW + 2 * (fromIntegral (blockPadding b) + boxPadding st)
+            pure (max (fromIntegral (blockMinWidth b)) inner + 2 * mh, th)
           k (regroup bss (zip3 (concat bss) lays ws))
         sp = fromIntegral (widgetSpacing cfg)
         pad = fromIntegral (edgePadding cfg)
-        groupWidth g = sum [ bw | (_, _, (bw, _)) <- g ]
+        groupStyleOf g = case g of
+          ((b, _, _) : _) -> blockGroupStyle b
+          [] -> Nothing
+        -- room taken by a widget's own box around its blocks, at each side
+        groupInset g = maybe 0 (\gs -> snd (boxMargin gs) + boxPadding gs) (groupStyleOf g)
+        groupWidth g = sum [ bw | (_, _, (bw, _)) <- g ] + 2 * groupInset g
         totalWidth gs = sum (map groupWidth gs) + sp * fromIntegral (max 0 (length gs - 1))
-        drawGroups x0 gs = fmap concat $ forM (zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs) $ \(gx, g) ->
-          fmap concat $ forM (zip (scanl (+) gx [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, th))) -> do
-            ic <- blockBitmap b (iconSize b)
-            drawBlock cfg cv b { blockIcon = ic } l x bw h th (iconSize b)
-            pure [ (x, x + bw, f) | Just f <- [blockOnClick b] ]
+        hovered x bw = maybe False (\hx -> hx >= x && hx < x + bw) hoverX
+        drawGroups x0 gs = fmap unzip' $ forM (zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs) $ \(gx, g) -> do
+          forM_ (groupStyleOf g) $ \gs -> do
+            let gst = if hovered gx (groupWidth g) then maybe gs (`mergeStyle` gs) (styleHover gs) else gs
+            drawBox cv gst gx (groupWidth g) h
+          fmap unzip' $ forM (zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, th))) -> do
+            let base = blockStyle b
+                st = if hovered x bw then maybe base (`mergeStyle` base) (styleHover base) else base
+            ic <- blockBitmap b st (iconSize b)
+            drawBlock cfg cv b { blockIcon = ic, blockStyle = st } l x bw h th (iconSize b)
+            pure ( [ (x, x + bw, f) | Just f <- [blockOnClick b] ]
+                 , [ (x, x + bw) | isJust (styleHover base) ] )
+        unzip' xs = (concatMap fst xs, concatMap snd xs)
     measure lb $ \lgs -> measure cb $ \cgs -> measure rb $ \rgs -> do
       let lw = totalWidth lgs
           rw = totalWidth rgs
           cw = totalWidth cgs
           rx = w - pad - rw
           cx = max (pad + lw + sp) (min (rx - sp - cw) ((w - cw) / 2))
-      h1 <- drawGroups pad lgs
-      h2 <- drawGroups cx cgs
-      h3 <- drawGroups rx rgs
-      pure (h1 ++ h2 ++ h3)
+      (h1, r1) <- drawGroups pad lgs
+      (h2, r2) <- drawGroups cx cgs
+      (h3, r3) <- drawGroups rx rgs
+      -- hover areas also cover the boxes of whole widgets
+      let groupRects x0 gs = [ (gx, gx + groupWidth g)
+                             | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
+                             , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
+      pure (h1 ++ h2 ++ h3, r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs)
   where
     safe act = act `E.catch` \(e :: E.SomeException) -> do
       hPutStrLn stderr ("waymobar: widget failed: " ++ show e)
       pure []
     regroup [] _ = []
     regroup (g : gs) xs = let (a, b) = splitAt (length g) xs in a : regroup gs b
+
+boxMargin :: Style -> (Double, Double)
+boxMargin = fromMaybe (0, 0) . styleMargin
+
+boxPadding :: Style -> Double
+boxPadding = fromMaybe 0 . stylePadding
+
+-- | The box of a style (background, lines, border) in a slot of the bar.
+drawBox :: Canvas -> Style -> Double -> Double -> Double -> IO ()
+drawBox cv st x bw h = do
+  let (mv, mh) = boxMargin st
+      bx = x + mh
+      by = mv
+      bwid = bw - 2 * mh
+      bh = h - 2 * mv
+      r = fromMaybe 0 (styleRadius st)
+      line = 2
+  when (bwid > 0 && bh > 0) $ do
+    forM_ (styleBg st) $ \bg -> setColor cv (color bg) >> fillRounded cv bx by bwid bh r
+    forM_ (styleUnderline st) $ \u -> setColor cv (color u) >> fillRect cv (bx + r / 2) (by + bh - line) (bwid - r) line
+    forM_ (styleOverline st) $ \u -> setColor cv (color u) >> fillRect cv (bx + r / 2) by (bwid - r) line
+    forM_ (styleBorder st) $ \(lw, bc) -> setColor cv (color bc) >> strokeRounded cv bx by bwid bh r lw
 
 -- | Lay out several pieces of markup; continuation-passing, so the layouts
 -- stay alive while drawing.
@@ -563,16 +612,14 @@ color s = fromMaybe (Color 0 0 0 1) (parseColor s)
 drawBlock :: Config -> Canvas -> Block -> TextLayout -> Double -> Double -> Double -> Int -> Double -> IO ()
 drawBlock cfg cv b l x bw h th isz = do
   let st = blockStyle b
-      line = 2
-      pad = fromIntegral (blockPadding b)
-  forM_ (styleBg st) $ \bg -> setColor cv (color bg) >> fillRect cv x 0 bw h
-  forM_ (styleUnderline st) $ \u -> setColor cv (color u) >> fillRect cv x (h - line) bw line
-  forM_ (styleOverline st) $ \u -> setColor cv (color u) >> fillRect cv x 0 bw line
+      (_, mh) = boxMargin st
+      pad = fromIntegral (blockPadding b) + boxPadding st
+  drawBox cv st x bw h
   tx <- case blockIcon b of
-    Nothing -> pure (x + pad)
+    Nothing -> pure (x + mh + pad)
     Just icon -> do
-      drawIcon cv icon (x + pad) (fromIntegral (round ((h - isz) / 2) :: Int)) isz
-      pure (x + pad + isz + 4)
+      drawIcon cv icon (x + mh + pad) (fromIntegral (round ((h - isz) / 2) :: Int)) isz
+      pure (x + mh + pad + isz + 4)
   unless (null (blockMarkup b)) $ do
     setColor cv (color (fromMaybe (fgColor cfg) (styleFg st)))
     showLayout cv l tx (fromIntegral (round ((h - fromIntegral th) / 2) :: Int))
@@ -820,8 +867,16 @@ pointer env p pe = do
     st = eState env
     rowAt pop y = findIndex (\(y0, y1) -> y >= y0 && y < y1) (pLayout pop)
     hover :: Maybe ObjectId -> Double -> Double -> IO ()
-    hover focus _ y = do
+    hover focus x y = do
       s <- readIORef st
+      -- bars: redraw when the pointer moves onto another hover area
+      forM_ (M.elems (sBars s)) $ \b -> do
+        let hx = if focus == Just (bSurface b) then Just x else Nothing
+            under = \px -> [ r | r@(x0, x1) <- bHoverRects b, Just p' <- [px], p' >= x0, p' < x1 ]
+            changed = under hx /= under (bHoverX b)
+        when (hx /= bHoverX b) $ modifyIORef' st $ \s' -> s'
+          { sBars = M.adjust (\b' -> b' { bHoverX = hx }) (bSurface b) (sBars s')
+          , sSurfs = if changed then M.adjust (\sf -> sf { sfDirty = True }) (bSurface b) (sSurfs s') else sSurfs s' }
       forM_ (sPopup s) $ \pop -> do
         let h = if focus == Just (pSurface pop) then rowAt pop y else Nothing
         when (h /= pHover pop) $ modifyIORef' st $ \s' -> s'

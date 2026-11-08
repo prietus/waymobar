@@ -16,6 +16,7 @@ module Waymobar.DBus
   , Bus
   , busName
   , connectSession
+  , connectSystem
   , call
   , callNoReply
   , emitSignal
@@ -377,6 +378,18 @@ connectSession = do
   addr <- lookupEnv "DBUS_SESSION_BUS_ADDRESS" >>= \case
     Just a | not (null a) -> pure a
     _ -> maybe "unix:path=/run/user/0/bus" (\d -> "unix:path=" ++ d ++ "/bus") <$> lookupEnv "XDG_RUNTIME_DIR"
+  connectAddress addr
+
+-- | Connect to the system bus (NetworkManager, UPower, ...) and say Hello.
+connectSystem :: IO Bus
+connectSystem = do
+  addr <- lookupEnv "DBUS_SYSTEM_BUS_ADDRESS" >>= \case
+    Just a | not (null a) -> pure a
+    _ -> pure "unix:path=/run/dbus/system_bus_socket"
+  connectAddress addr
+
+connectAddress :: String -> IO Bus
+connectAddress addr = do
   sockAddr <- case parseAddress addr of
     Just sa -> pure sa
     Nothing -> E.throwIO (userError ("unsupported D-Bus address: " ++ addr))

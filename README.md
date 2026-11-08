@@ -24,7 +24,7 @@ clicking them acts on rivermonad.
 ## Build
 
 ```sh
-sudo apt install libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev   # plus ghc and cabal-install
+sudo apt install libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libpulse-dev   # plus ghc and cabal-install
 cd waymobar
 cabal install --lib waymobar      # so ghc can compile your config
 cabal install exe:waymobar
@@ -83,6 +83,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 |---|---|
 | `workspaces cfg` | one clickable block per rivermonad workspace; the wheel cycles them |
 | `layoutName fmt` | layout of the workspace on this output; click = next layout |
+| `logoutButton label` | asks for confirmation, then logs out gracefully: windows are asked to close, and the session ends (back to GDM) once they have; cancelled if one refuses |
 | `windowTitle n` | focused window's title, cut to `n` characters |
 | `clock fmt` | `formatTime` format, updated on the second |
 | `cpu f`, `memory f` | percentages, `f :: Int -> String` |
@@ -90,6 +91,9 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `command cmd secs` | first line of a shell command, every `secs` seconds |
 | `commandReader cmd` | last line printed by a long-running command (markup) |
 | `tray defaultTray` | system tray (see below) |
+| `volume f` | volume of the default output, live (see below) |
+| `network secs f` | connection, Wi-Fi network and signal, IP, traffic |
+| `mpris f` | the current media player (see below) |
 | `text markup` | fixed text |
 | `periodic secs io` | any `IO String` (`readCommand` gives a command's first line) |
 
@@ -128,6 +132,111 @@ A path (anything with a `/`, `~/...`, or an image extension) is a file;
 anything else is looked up in the icon theme, e.g.
 `withIcon "audio-volume-high-symbolic" volume`. `-symbolic` icons take
 the text colour. Tray icons from the theme use the same mechanism.
+
+### Styling
+
+Instead of CSS, a `Style` (every field optional) says how a block looks;
+the waybar equivalents are in the comments:
+
+```haskell
+pill :: Style
+pill = noStyle
+  { styleFg      = Just "#d8dee9"            -- color
+  , styleBg      = Just "#2e3440"            -- background
+  , styleBorder  = Just (1, "#434c5e")       -- border: 1px solid
+  , styleRadius  = Just 12                   -- border-radius
+  , styleMargin  = Just (3, 0)               -- margin: 3px 0 (vertical, horizontal)
+  , stylePadding = Just 10                   -- padding: 0 10px
+  , styleHover   = Just noStyle { styleBg = Just "#3b4252" }   -- :hover
+  }
+```
+
+`styleUnderline`/`styleOverline` draw a 2 px line at the bottom/top of the
+box. Apply styles with:
+
+| Combinator | |
+|---|---|
+| `withStyle s w` | `s` over the widget's blocks (its fields win) |
+| `baseStyle s w` | `s` under them (the widget's own colours win, e.g. warnings) |
+| `groupStyle s w` | one box behind all the blocks of a widget: a pill around the workspace buttons or the tray icons |
+| `hoverStyle s w` | merged over a block while the pointer is on it |
+| `colored c w`, `padded n w` | shortcuts for the text colour and padding |
+
+The bar itself has `bgColor` (`#rrggbbaa` for transparency: `"#00000000"`
+draws only the widgets), `barRadius`, `barBorder` and `margins` (space to
+the screen edges, for a floating bar). Per-state styles of `workspaces`
+(`focusedStyle`, `activeStyle`, ...) take the same fields, so each
+workspace can be a small pill:
+
+```haskell
+myWorkspaces = groupStyle pill { stylePadding = Just 3 } $ workspaces defaultWorkspaces
+  { focusedStyle = wsPill { styleBg = Just "#88c0d0", styleFg = Just "#2e3440" }
+  , hiddenStyle  = wsPill { styleHover = Just noStyle { styleBg = Just "#3b4252" } } }
+  where wsPill = noStyle { styleRadius = Just 9, styleMargin = Just (6, 1) }
+
+main = waymobar def
+  { bgColor = "#00000000", barHeight = 30, widgetSpacing = 6
+  , left = [ myWorkspaces ]
+  , right = map (baseStyle pill) [ cpu (\p -> show p ++ "%"), clock "%H:%M" ] }
+```
+
+Fonts: `font` for the bar, and pango markup for any part of a text
+(`<span font='Iosevka 11' weight='bold'>`).
+
+### Volume
+
+`volume f` follows the default output through libpulse, so it is updated
+the moment anything changes the volume (keys, pavucontrol, `wpctl`) without
+polling. It talks to PipeWire through **pipewire-pulse** (installed by
+default on Ubuntu, Fedora and Debian; `pacman -S pipewire-pulse` on Arch),
+or to PulseAudio. Without either it falls back to asking WirePlumber with
+`wpctl` every 2 seconds.
+
+```haskell
+volume $ \case
+  Nothing -> ""                                  -- no output: hide
+  Just v | volMuted v -> "muted"
+         | otherwise  -> "vol " ++ show (volPercent v) ++ "%"
+```
+
+(`\case` needs `{-# LANGUAGE LambdaCase #-}` at the top of your config.)
+Left click mutes, the wheel changes the volume (`volumeWith
+defaultVolume { volStep = 2, volMax = 150 }` to change the step and the
+limit). `toggleMute` and `changeVolume` are exported for your own handlers;
+`volDevice` is the output's name.
+
+### Network
+
+`network secs f` shows the interface of the default route; `f` gets
+`Nothing` when offline, or a `NetInfo` with `netInterface`, `netKind`
+(`Wifi`, `Ethernet`, `OtherNet`), `netName` (the Wi-Fi network or the
+NetworkManager connection), `netSignal` (Wi-Fi, percent), `netAddress`
+(IPv4) and `netRxRate`/`netTxRate` (bytes per second; `formatRate` prints
+them). The name and signal come from NetworkManager over the system bus
+when it runs; the rest from the kernel.
+
+```haskell
+network 3 $ \case
+  Nothing -> "offline"
+  Just n -> case netKind n of
+    Wifi -> maybe "wifi" escape (netName n) ++ maybe "" (\s -> " " ++ show s ++ "%") (netSignal n)
+    _    -> maybe (netInterface n) id (netAddress n)
+```
+
+### Media players
+
+`mpris f` shows one MPRIS player (Spotify, Firefox, Chromium, VLC, mpv
+with mpv-mpris...): the one playing, or else the one that changed last;
+hidden when there is none. `f` gets a `Media` with `mediaPlayer`,
+`mediaStatus` (`Playing`, `Paused`, `Stopped`), `mediaTitle`,
+`mediaArtist` and `mediaAlbum`; escape them, they are plain text. Left
+click plays/pauses, right click skips to the next track, middle click goes
+back.
+
+```haskell
+mpris $ \m -> (if mediaStatus m == Playing then "▶ " else "⏸ ")
+             ++ escape (shorten 50 (mediaArtist m ++ " - " ++ mediaTitle m))
+```
 
 ### System tray
 

@@ -56,6 +56,7 @@ data Action
   | FocusUp
   | FocusDown
   | Restart
+  | Logout                 -- ^ close every window gracefully, then end the session
   deriving (Eq, Show)
 
 data RivermonadClient = RivermonadClient
@@ -141,6 +142,7 @@ sendAction a = void $ forkIO $ void $ (E.try :: IO () -> IO (Either E.SomeExcept
       FocusUp -> J.str "FocusUp"
       FocusDown -> J.str "FocusDown"
       Restart -> J.str "Restart"
+      Logout -> J.str "Logout"
 
 -- | Parse one @{"State":{...}}@ line.
 parseState :: B.ByteString -> Maybe RState

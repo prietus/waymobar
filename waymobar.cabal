@@ -28,6 +28,7 @@ library
   default-extensions: LambdaCase
   exposed-modules:
     Waymobar
+    Waymobar.Audio
     Waymobar.Bar
     Waymobar.Config
     Waymobar.Core
@@ -36,14 +37,16 @@ library
     Waymobar.Icons
     Waymobar.JSON
     Waymobar.Main
+    Waymobar.Media
+    Waymobar.Network
     Waymobar.Recompile
     Waymobar.Rivermonad
     Waymobar.Tray
     Waymobar.Widgets
     Waymobar.Wayland.Protocol
     Waymobar.Wayland.Wire
-  c-sources:        cbits/waymobar.c, cbits/icons.c
-  pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0
+  c-sources:        cbits/waymobar.c, cbits/icons.c, cbits/pulse.c, cbits/net.c
+  pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0, libpulse
   build-depends:
       base        >=4.16 && <5
     , binary      >=0.8  && <0.11

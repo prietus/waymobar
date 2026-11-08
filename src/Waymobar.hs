@@ -14,6 +14,9 @@ module Waymobar
   , module Waymobar.Core
   , module Waymobar.Widgets
   , module Waymobar.Tray
+  , module Waymobar.Audio
+  , module Waymobar.Network
+  , module Waymobar.Media
   , R.Action (..)
   , R.Workspace (..)
   , R.RState (..)
@@ -26,6 +29,9 @@ import Waymobar.Core
 import qualified Waymobar.Rivermonad as R
 import Waymobar.Widgets
 import Waymobar.Tray
+import Waymobar.Audio
+import Waymobar.Network
+import Waymobar.Media
 
 -- | Run a bar with this configuration on every output.
 waymobar :: Config -> IO ()

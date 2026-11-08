@@ -7,6 +7,8 @@ module Waymobar.Draw
   , parseColor
   , setColor
   , fillRect
+  , fillRounded
+  , strokeRounded
   , clear
     -- * Text
   , Font
@@ -75,6 +77,17 @@ foreign import ccall unsafe "cairo_set_operator"
   c_set_operator :: Ptr Cairo -> CInt -> IO ()
 foreign import ccall unsafe "cairo_move_to"
   c_move_to :: Ptr Cairo -> CDouble -> CDouble -> IO ()
+
+foreign import ccall unsafe "cairo_new_path"
+  c_new_path :: Ptr Cairo -> IO ()
+foreign import ccall unsafe "cairo_close_path"
+  c_close_path :: Ptr Cairo -> IO ()
+foreign import ccall unsafe "cairo_arc"
+  c_arc :: Ptr Cairo -> CDouble -> CDouble -> CDouble -> CDouble -> CDouble -> IO ()
+foreign import ccall unsafe "cairo_set_line_width"
+  c_set_line_width :: Ptr Cairo -> CDouble -> IO ()
+foreign import ccall unsafe "cairo_stroke"
+  c_stroke :: Ptr Cairo -> IO ()
 
 foreign import ccall unsafe "cairo_save"
   c_save :: Ptr Cairo -> IO ()
@@ -238,3 +251,30 @@ canvasScale (Canvas cr) = alloca $ \px -> alloca $ \py -> do
   poke py 0
   c_user_to_device_distance cr px py
   realToFrac <$> peek px
+
+-- | A rectangle with rounded corners (radius clamped to half the shorter side).
+roundedPath :: Ptr Cairo -> Double -> Double -> Double -> Double -> Double -> IO ()
+roundedPath cr x y w h r0 = do
+  let r = max 0 (minimum [r0, w / 2, h / 2])
+      d = realToFrac :: Double -> CDouble
+  c_new_path cr
+  if r <= 0
+    then c_rectangle cr (d x) (d y) (d w) (d h)
+    else do
+      c_arc cr (d (x + w - r)) (d (y + r)) (d r) (d (-pi / 2)) 0
+      c_arc cr (d (x + w - r)) (d (y + h - r)) (d r) 0 (d (pi / 2))
+      c_arc cr (d (x + r)) (d (y + h - r)) (d r) (d (pi / 2)) (d pi)
+      c_arc cr (d (x + r)) (d (y + r)) (d r) (d pi) (d (3 * pi / 2))
+      c_close_path cr
+
+-- | Fill a rounded rectangle with the current colour.
+fillRounded :: Canvas -> Double -> Double -> Double -> Double -> Double -> IO ()
+fillRounded (Canvas cr) x y w h r = roundedPath cr x y w h r >> c_fill cr
+
+-- | Outline a rounded rectangle: the line lies inside the given box.
+strokeRounded :: Canvas -> Double -> Double -> Double -> Double -> Double -> Double -> IO ()
+strokeRounded (Canvas cr) x y w h r lw = do
+  let i = lw / 2
+  roundedPath cr (x + i) (y + i) (w - lw) (h - lw) (max 0 (r - i))
+  c_set_line_width cr (realToFrac lw)
+  c_stroke cr

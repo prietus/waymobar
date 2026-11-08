@@ -19,6 +19,7 @@ module Waymobar.Widgets
   , workspaces
   , layoutName
   , windowTitle
+  , logoutButton
     -- * Icons
   , icon
   , withIcon
@@ -29,6 +30,9 @@ module Waymobar.Widgets
   , onClick
   , spawnOnClick
   , withStyle
+  , baseStyle
+  , groupStyle
+  , hoverStyle
   , colored
   , padded
   , markup
@@ -312,6 +316,20 @@ iconColor c = mapBlocks (\b -> b { blockIconColor = Just c, blockIconRecolorAll 
 withIconSize :: Int -> Widget -> Widget
 withIconSize n = mapBlocks (\b -> b { blockIconSize = n })
 
+-- | A button that logs out of the rivermonad session after confirming in a
+-- menu: every window is asked to close (so applications can save), then the
+-- session ends and the display manager (GDM...) shows its login screen. If
+-- a window refuses to close within 10 seconds, the logout is cancelled.
+--
+-- > logoutButton "\xf011"   -- nf-fa-power_off
+logoutButton :: String -> Widget
+logoutButton label = Widget $ \env -> pure $ \_ -> pure
+  [ (block label)
+      { blockOnClick = Just $ \c -> when (clickButton c == LeftButton) $ clickMenu c
+          [ menuItem "Log out" (rivermonadDo env Logout)
+          , MenuSeparator
+          , menuItem "Cancel" (pure ()) ] } ]
+
 ------------------------------------------------------------------------------
 -- Combinators
 
@@ -323,8 +341,25 @@ onClick h = mapBlocks (\b -> b { blockOnClick = Just h })
 spawnOnClick :: String -> Widget -> Widget
 spawnOnClick cmd = onClick (\c -> when (clickButton c == LeftButton) (spawn cmd))
 
+-- | Style every block of a widget; the fields set in the given style win
+-- over the block's own (e.g. a state colour of 'workspaces').
 withStyle :: Style -> Widget -> Widget
-withStyle s = mapBlocks (\b -> b { blockStyle = s })
+withStyle s = mapBlocks (\b -> b { blockStyle = mergeStyle s (blockStyle b) })
+
+-- | Like 'withStyle', but the block's own style wins: a common look under
+-- per-state styles.
+baseStyle :: Style -> Widget -> Widget
+baseStyle s = mapBlocks (\b -> b { blockStyle = mergeStyle (blockStyle b) s })
+
+-- | One box behind all the blocks of a widget (a "pill" around the
+-- workspace buttons, say). Uses the background, border, radius, margin
+-- and padding of the style.
+groupStyle :: Style -> Widget -> Widget
+groupStyle s = mapBlocks (\b -> b { blockGroupStyle = Just (maybe s (mergeStyle s) (blockGroupStyle b)) })
+
+-- | Style merged over the blocks while the pointer is on them (CSS :hover).
+hoverStyle :: Style -> Widget -> Widget
+hoverStyle h = mapBlocks (\b -> b { blockStyle = mergeStyle noStyle { styleHover = Just h } (blockStyle b) })
 
 -- | Set the text colour.
 colored :: String -> Widget -> Widget
