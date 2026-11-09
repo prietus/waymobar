@@ -31,6 +31,16 @@ See it in a whole desktop in [rivermonad's demo](https://github.com/prietus/rive
 
 ## Build
 
+Arch Linux and Fedora: build the package from
+[packaging/](packaging/README.md); it installs waymobar and the library
+your configuration is compiled against.
+
+```sh
+cd packaging/arch && makepkg -si                 # Arch
+```
+
+From source:
+
 ```sh
 sudo apt install libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libpulse-dev   # plus ghc and cabal-install
 cd waymobar

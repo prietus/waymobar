@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               waymobar
-version:            0.1.0.0
+version:            0.1.0
 synopsis:           A Wayland status bar written and configured in Haskell
 description:
   waymobar is a status bar for Wayland compositors with wlr-layer-shell,
@@ -18,11 +18,20 @@ extra-doc-files:    README.md
 data-files:         examples/waymobar.hs
 extra-source-files: protocol/*.xml, tools/gen-protocol.py, tools/regen.sh
 
+flag dynamic-config
+  description: Link the user configuration dynamically (-dynamic), for
+               distributions that ship Haskell libraries as shared objects
+               only, like Arch Linux.
+  default:     False
+  manual:      True
+
 common warnings
   ghc-options: -Wall -Wno-name-shadowing
 
 library
   import:           warnings
+  if flag(dynamic-config)
+    cpp-options:    -DDYNAMIC_CONFIG
   hs-source-dirs:   src
   default-language: GHC2021
   default-extensions: LambdaCase

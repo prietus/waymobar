@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 -- | Finding, compiling and launching the user configuration
 -- (@~/.config/waymobar/waymobar.hs@), the same way xmonad does.
 module Waymobar.Recompile
@@ -64,10 +65,11 @@ recompile force = do
         else do
           let cp
                 | useScript = (proc buildScript [cfgBinary d]) { cwd = Just (dirConfig d) }
-                | otherwise = (proc "ghc"
+                | otherwise = (proc "ghc" $
                     [ "--make", "waymobar.hs", "-i", "-ilib", "-fforce-recomp"
-                    , "-main-is", "main", "-threaded", "-v0"
-                    , "-outputdir", dirCache d </> ("build-" ++ arch ++ "-" ++ os)
+                    , "-main-is", "main", "-threaded", "-v0" ]
+                    ++ dynamicFlags ++
+                    [ "-outputdir", dirCache d </> ("build-" ++ arch ++ "-" ++ os)
                     , "-o", cfgBinary d ]) { cwd = Just (dirConfig d) }
           r <- E.try (readCreateProcessWithExitCode cp "")
           case r of
@@ -82,6 +84,14 @@ recompile force = do
       hPutStrLn stderr ("waymobar: recompilation failed:\n" ++ msg)
       notify ("Error compiling " ++ cfgSource d ++ "\n\n" ++ take 800 msg)
       pure False
+
+-- | Distributions that only ship shared Haskell libraries need -dynamic.
+dynamicFlags :: [String]
+#ifdef DYNAMIC_CONFIG
+dynamicFlags = ["-dynamic"]
+#else
+dynamicFlags = []
+#endif
 
 needsBuild :: FilePath -> [FilePath] -> IO Bool
 needsBuild bin srcs = do
