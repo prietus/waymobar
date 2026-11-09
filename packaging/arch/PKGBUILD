@@ -14,7 +14,7 @@ optdepends=('rivermonad: workspaces, layout and window title widgets'
             'ttf-nerd-fonts-symbols: icons'
             'libnotify: notifications when the configuration fails to compile')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('77539a0593a6a174fcfd6ab359f709a6452e0af26852256f400300f41a34d6b1')
 
 build() {
   cd $pkgname-$pkgver
