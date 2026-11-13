@@ -168,11 +168,12 @@ data Block = Block
   , blockIconColor      :: Maybe String      -- ^ colour for symbolic icons; 'Nothing' = the text colour
   , blockIconRecolorAll :: Bool              -- ^ recolour every icon, not only @-symbolic@ ones
   , blockGroupStyle     :: Maybe Style       -- ^ a box behind all the blocks of the widget (from its first block)
+  , blockHoverMarkup    :: Maybe String      -- ^ shown instead of 'blockMarkup' while the pointer is on the block
   }
 
 -- | A block showing some markup, without padding or click handler.
 block :: String -> Block
-block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False Nothing
+block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False Nothing Nothing
 
 styled :: Style -> Block -> Block
 styled s b = b { blockStyle = s }

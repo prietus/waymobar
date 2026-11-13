@@ -36,6 +36,7 @@ module Waymobar.Widgets
   , colored
   , padded
   , markup
+  , hoverMarkup
   , spawn
   , escape
   , shorten
@@ -372,6 +373,14 @@ padded p = mapBlocks (\b -> b { blockPadding = blockPadding b + p })
 -- | Transform the markup of every block, e.g. @markup ("cpu " ++)@.
 markup :: (String -> String) -> Widget -> Widget
 markup f = mapBlocks (\b -> b { blockMarkup = f (blockMarkup b) })
+
+-- | Markup shown instead of the block's own while the pointer is on it,
+-- computed from the normal markup: the block grows in place (like a
+-- tooltip, but inside the bar).
+--
+-- > hoverMarkup (++ " – click to log out") (logoutButton "⏻")
+hoverMarkup :: (String -> String) -> Widget -> Widget
+hoverMarkup f = mapBlocks (\b -> b { blockHoverMarkup = Just (f (blockMarkup b)) })
 
 mapBlocks :: (Block -> Block) -> Widget -> Widget
 mapBlocks f (Widget start) = Widget $ \env -> do

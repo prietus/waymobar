@@ -20,9 +20,9 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (find, findIndex)
+import Data.List (find, findIndex, mapAccumL)
 import qualified Data.Map.Strict as M
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word8, Word32)
@@ -102,6 +102,7 @@ data Bar = Bar
   , bHits       :: [(Double, Double, Click -> IO ())]
   , bHoverX     :: Maybe Double                -- ^ pointer position, for hover styles
   , bHoverRects :: [(Double, Double)]          -- ^ blocks that have a hover style
+  , bExpanded   :: Maybe Int                   -- ^ the block showing its hover markup (numbered left to right)
   }
 
 -- | A row of an open menu.
@@ -382,8 +383,8 @@ redrawDirty env = do
         h = fromIntegral (sfH sf)
     case (M.lookup surf (sBars s), sPopup s) of
       (Just b, _) -> do
-        res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) w h
-        forM_ res $ \(hs, hr) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr }) surf (sBars s') }
+        res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) (bExpanded b) w h
+        forM_ res $ \(hs, hr, ex) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bExpanded = ex }) surf (sBars s') }
       (_, Just p) | pSurface p == surf -> void $ present env sf $ \cv -> paintMenu env cv p w h
       _ -> pure ()
 
@@ -469,7 +470,7 @@ createBar env o out = do
     wlSurfaceCommit c surf
     modifyIORef' st $ \s -> s
       { sSurfs = M.insert surf sf { sfH = eHeight env } (sSurfs s)
-      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing []) (sBars s)
+      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing [] Nothing) (sBars s)
       , sOutputs = M.adjust (\x -> x { oBar = Just surf }) o (sOutputs s) }
   where
     c = eConn env
@@ -493,10 +494,11 @@ destroyBar env b = do
 ------------------------------------------------------------------------------
 -- Drawing bars
 
--- | Draw a bar; returns its click areas and the areas with a hover style.
-paintBar :: Env -> Canvas -> Output -> Maybe Double -> Double -> Double
-         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)])
-paintBar env cv out hoverX w h = do
+-- | Draw a bar; returns its click areas, the areas that react to the
+-- pointer, and the block showing its hover markup, if any.
+paintBar :: Env -> Canvas -> Output -> Maybe Double -> Maybe Int -> Double -> Double
+         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], Maybe Int)
+paintBar env cv out hoverX expanded w h = do
   let cfg = eCfg env
       (ls, cs, rs) = eWidgets env
       hasIcon b = isJust (blockIcon b) || isJust (blockIconSource b)
@@ -518,9 +520,16 @@ paintBar env cv out hoverX w h = do
               Color r g bl _ = color (fromMaybe (fromMaybe (fgColor cfg) (styleFg st)) (blockIconColor b))
           ic <- resolveIcon src px (Just (r, g, bl)) (blockIconRecolorAll b)
           pure (maybe (blockIcon b) Just ic)
-  lb <- blocksOf ls
-  cb <- blocksOf cs
-  rb <- blocksOf rs
+  lb0 <- blocksOf ls
+  cb0 <- blocksOf cs
+  rb0 <- blocksOf rs
+  let allBlocks = concat (lb0 ++ cb0 ++ rb0)
+      hasHover i = maybe False (isJust . blockHoverMarkup) (listToMaybe (drop i allBlocks))
+      -- block number @mi@ (left to right) shows its hover markup
+      expand mi (a, b, c) = let (i1, a') = area 0 a; (i2, b') = area i1 b; (_, c') = area i2 c in (a', b', c')
+        where
+          area = mapAccumL (mapAccumL swap)
+          swap i blk = (i + 1 :: Int, if Just i == mi then blk { blockMarkup = fromMaybe (blockMarkup blk) (blockHoverMarkup blk) } else blk)
   withFont (font cfg) $ \fnt -> do
     let iconSize b = fromIntegral (if blockIconSize b > 0 then blockIconSize b else max 8 (round h - 8))
         iconPart b
@@ -555,22 +564,41 @@ paintBar env cv out hoverX w h = do
             ic <- blockBitmap b st (iconSize b)
             drawBlock cfg cv b { blockIcon = ic, blockStyle = st } l x bw h th (iconSize b)
             pure ( [ (x, x + bw, f) | Just f <- [blockOnClick b] ]
-                 , [ (x, x + bw) | isJust (styleHover base) ] )
+                 , [ (x, x + bw) | isJust (styleHover base) || isJust (blockHoverMarkup b) ] )
         unzip' xs = (concatMap fst xs, concatMap snd xs)
-    measure lb $ \lgs -> measure cb $ \cgs -> measure rb $ \rgs -> do
-      let lw = totalWidth lgs
-          rw = totalWidth rgs
-          cw = totalWidth cgs
-          rx = w - pad - rw
-          cx = max (pad + lw + sp) (min (rx - sp - cw) ((w - cw) / 2))
-      (h1, r1) <- drawGroups pad lgs
-      (h2, r2) <- drawGroups cx cgs
-      (h3, r3) <- drawGroups rx rgs
-      -- hover areas also cover the boxes of whole widgets
-      let groupRects x0 gs = [ (gx, gx + groupWidth g)
-                             | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
-                             , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
-      pure (h1 ++ h2 ++ h3, r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs)
+        -- the slot of every block, in numbering order
+        blockRects x0 gs = concat
+          [ [ (x, bw) | (x, (_, _, (bw, _))) <- zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g ]
+          | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs ]
+        layout mi k = let (lb, cb, rb) = expand mi (lb0, cb0, rb0) in
+          measure lb $ \lgs -> measure cb $ \cgs -> measure rb $ \rgs -> do
+            let lw = totalWidth lgs
+                rw = totalWidth rgs
+                cw = totalWidth cgs
+                rx = w - pad - rw
+                cx = max (pad + lw + sp) (min (rx - sp - cw) ((w - cw) / 2))
+            k (lgs, cgs, rgs, cx, rx)
+        hoveredBlock (lgs, cgs, rgs, cx, rx) =
+          findIndex (uncurry hovered) (blockRects pad lgs ++ blockRects cx cgs ++ blockRects rx rgs)
+        draw ex (lgs, cgs, rgs, cx, rx) = do
+          (h1, r1) <- drawGroups pad lgs
+          (h2, r2) <- drawGroups cx cgs
+          (h3, r3) <- drawGroups rx rgs
+          -- hover areas also cover the boxes of whole widgets
+          let groupRects x0 gs = [ (gx, gx + groupWidth g)
+                                 | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
+                                 , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
+          pure (h1 ++ h2 ++ h3, r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs, ex)
+    -- The pointer is tested against what is on screen (with the block
+    -- expanded last time); if that changes which block shows its hover
+    -- markup, the bar is laid out again before drawing. An expanded block
+    -- keeps the pointer inside it (it grows towards the free space), so
+    -- there is no flicker at its edges.
+    layout expanded $ \g -> do
+      let ex = case hoveredBlock g of
+            Just i | hasHover i -> Just i
+            _ -> Nothing
+      if ex == expanded then draw ex g else layout ex (draw ex)
   where
     safe act = act `E.catch` \(e :: E.SomeException) -> do
       hPutStrLn stderr ("waymobar: widget failed: " ++ show e)
