@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Wayland side: one layer-shell surface per output, drawn with
--- cairo/pango into shared memory buffers, plus popup menus.
+-- cairo/pango into shared memory buffers, plus popup menus and the
+-- popovers that show hover markup.
 --
 -- Threads: a reader thread decodes compositor events, widgets update
 -- their contents from their own threads; everything ends up in one queue
@@ -20,7 +21,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (find, findIndex, mapAccumL)
+import Data.List (find, findIndex)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Text as T
@@ -29,6 +30,7 @@ import Data.Word (Word8, Word32)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr, nullPtr)
+import GHC.Clock (getMonotonicTime)
 import System.Environment (setEnv)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
@@ -51,6 +53,7 @@ data Msg
   | MsgClosed String
   | MsgMenu ObjectId (Double, Double) [MenuEntry]  -- ^ bar surface, anchor, entries
   | MsgMenuTimeout Int                              -- ^ close the menu if the pointer is still away
+  | MsgTick                                         -- ^ nothing to do but look at the clock (animations)
 
 data Globals = Globals
   { gCompositor :: Maybe (ObjectId, Word32)  -- ^ object and bound version
@@ -102,7 +105,22 @@ data Bar = Bar
   , bHits       :: [(Double, Double, Click -> IO ())]
   , bHoverX     :: Maybe Double                -- ^ pointer position, for hover styles
   , bHoverRects :: [(Double, Double)]          -- ^ blocks that have a hover style
-  , bExpanded   :: Maybe Int                   -- ^ the block showing its hover markup (numbered left to right)
+  , bTips       :: [(Double, Double, String)]  -- ^ blocks with hover markup, shown in a popover
+  }
+
+-- | The popover showing the hover markup of a block. It takes no input:
+-- the pointer stays on the bar.
+data Tip = Tip
+  { tSurface :: ObjectId
+  , tXdgSurf :: ObjectId
+  , tPopup   :: ObjectId
+  , tBar     :: ObjectId                -- ^ parent bar surface
+  , tArea    :: (Double, Double)        -- ^ the block it belongs to
+  , tMarkup  :: String
+  , tFrom    :: Double                  -- ^ opacity the running fade started at
+  , tTo      :: Double                  -- ^ opacity it ends at: 1 (showing) or 0 (going away)
+  , tStart   :: Double                  -- ^ when it started (monotonic seconds)
+  , tFrame   :: Maybe ObjectId          -- ^ pending frame callback
   }
 
 -- | A row of an open menu.
@@ -119,6 +137,8 @@ data Popup = Popup
   , pStack   :: [[MenuEntry]]           -- ^ parent menus, for "back"
   , pHover   :: Maybe Int
   , pAway    :: Int                     -- ^ bumped whenever the pointer leaves our surfaces
+  , pStart   :: Maybe Double            -- ^ when its fade-in started ('Nothing' = shown at once)
+  , pFrame   :: Maybe ObjectId          -- ^ pending frame callback
   }
 
 data Seat = Seat
@@ -136,6 +156,7 @@ data S = S
   , sSurfs     :: M.Map ObjectId Surf     -- ^ by wl_surface
   , sBars      :: M.Map ObjectId Bar      -- ^ by wl_surface
   , sPopup     :: Maybe Popup
+  , sTip       :: Maybe Tip
   , sSeats     :: M.Map ObjectId Seat
   , sLastPress :: Maybe (ObjectId, Word32)  -- ^ seat and serial of the last button press
   , sReady     :: Bool                      -- ^ the initial roundtrip is done
@@ -180,7 +201,7 @@ runBar cfg = do
 
   st <- newIORef S
     { sGlobals = Globals Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-    , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing
+    , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
   let env = Env conn reg cfg h ws st sync push
   let loop = do
@@ -229,7 +250,7 @@ handle env = \case
   MsgRedraw -> do
     modifyIORef' (eState env) $ \s -> s { sSurfs = M.mapWithKey (\k sf -> if M.member k (sBars s) then sf { sfDirty = True } else sf) (sSurfs s) }
     pure False
-  MsgMenu bar area entries -> openMenu env bar area entries [] >> pure False
+  MsgMenu bar area entries -> openMenu env bar area entries [] True >> pure False
   MsgMenuTimeout gen -> do
     -- river does not dismiss popups on outside clicks: close the menu once
     -- the pointer has been away from it (and from the bar) for a while
@@ -237,6 +258,7 @@ handle env = \case
     let onUs = any (isJust . sFocus) (M.elems (sSeats s))
     forM_ (sPopup s) $ \p -> when (pAway p == gen && not onUs) (closeMenu env)
     pure False
+  MsgTick -> pure False
   MsgEvent ev -> event env ev >> pure False
 
 event :: Env -> Event -> IO ()
@@ -261,6 +283,16 @@ event env ev = case ev of
       exitFailure
     writeIORef st s { sReady = True }
     createBars env
+  EvWlCallback cb (WlCallbackDone _) -> do
+    -- the compositor is ready for the next frame of a fade
+    mp <- sPopup <$> readIORef st
+    forM_ mp $ \p -> when (pFrame p == Just cb) $ do
+      modifyIORef' st $ \s -> s { sPopup = Just p { pFrame = Nothing } }
+      updSurf (pSurface p) (\sf -> sf { sfDirty = True })
+    mt <- sTip <$> readIORef st
+    forM_ mt $ \t -> when (tFrame t == Just cb) $ do
+      modifyIORef' st $ \s -> s { sTip = Just t { tFrame = Nothing } }
+      updSurf (tSurface t) (\sf -> sf { sfDirty = True })
   EvWlOutput o oe -> do
     let upd f = modifyIORef' st $ \s -> s { sOutputs = M.adjust f o (sOutputs s) }
     case oe of
@@ -287,9 +319,15 @@ event env ev = case ev of
     forM_ mp $ \p -> when (pXdgSurf p == xs) $ do
       xdgSurfaceAckConfigure c xs serial
       updSurf (pSurface p) (\sf -> sf { sfConfigured = True, sfDirty = True })
+    mt <- sTip <$> readIORef st
+    forM_ mt $ \t -> when (tXdgSurf t == xs) $ do
+      xdgSurfaceAckConfigure c xs serial
+      updSurf (tSurface t) (\sf -> sf { sfConfigured = True, sfDirty = True })
   EvXdgPopup xp XdgPopupPopupDone -> do
     mp <- sPopup <$> readIORef st
     forM_ mp $ \p -> when (pPopup p == xp) (closeMenu env)
+    mt <- sTip <$> readIORef st
+    forM_ mt $ \t -> when (tPopup t == xp) (closeTip env)
   EvWpFractionalScaleV1 fs (WpFractionalScaleV1PreferredScale sc) ->
     modifyIORef' st $ \s -> s { sSurfs = M.map (\sf -> if sfFrac sf == Just fs then sf { sfScale120 = fromIntegral sc, sfDirty = True } else sf) (sSurfs s) }
   EvWlSurface surf (WlSurfacePreferredBufferScale sc) ->
@@ -377,16 +415,36 @@ newBuffer c shm w h = do
 redrawDirty :: Env -> IO ()
 redrawDirty env = do
   s <- readIORef (eState env)
-  forM_ (M.elems (sSurfs s)) $ \sf -> when (sfDirty sf && sfConfigured sf) $ do
-    let surf = sfSurface sf
-        w = fromIntegral (sfW sf)
-        h = fromIntegral (sfH sf)
-    case (M.lookup surf (sBars s), sPopup s) of
-      (Just b, _) -> do
-        res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) (bExpanded b) w h
-        forM_ res $ \(hs, hr, ex) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bExpanded = ex }) surf (sBars s') }
-      (_, Just p) | pSurface p == surf -> void $ present env sf $ \cv -> paintMenu env cv p w h
-      _ -> pure ()
+  forM_ (M.elems (sBars s)) $ \b -> forM_ (M.lookup (bSurface b) (sSurfs s)) $ \sf ->
+    when (sfDirty sf && sfConfigured sf) $ do
+      let surf = sfSurface sf
+      res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      forM_ res $ \(hs, hr, ts) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bTips = ts }) surf (sBars s') }
+  -- the bars know what is under the pointer now
+  syncTip env
+  s' <- readIORef (eState env)
+  let dirty surf = [ sf | Just sf <- [M.lookup surf (sSurfs s')], sfDirty sf, sfConfigured sf ]
+  forM_ (sPopup s') $ \p -> forM_ (dirty (pSurface p)) $ \sf -> do
+    now <- getMonotonicTime
+    let a = menuAlpha (eCfg env) p now
+    cb <- present env sf $ \cv -> do
+      paintMenu env cv p a (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      if a < 1 && isNothing (pFrame p)
+        then Just <$> wlSurfaceFrame (eConn env) (sfSurface sf)
+        else pure Nothing
+    forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
+      x { sPopup = (\p' -> p' { pFrame = Just f }) <$> sPopup x }
+  forM_ (sTip s') $ \t -> forM_ (dirty (tSurface t)) $ \sf -> do
+    now <- getMonotonicTime
+    let a = tipAlpha (eCfg env) t now
+    -- while it fades, draw again as soon as the compositor shows this frame
+    cb <- present env sf $ \cv -> do
+      paintTip env cv t a (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      if a /= tTo t && isNothing (tFrame t)
+        then Just <$> wlSurfaceFrame (eConn env) (sfSurface sf)
+        else pure Nothing
+    forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
+      x { sTip = (\t' -> t' { tFrame = Just f }) <$> sTip x }
 
 -- | Draw a surface into a free buffer and commit it. Nothing if no buffer
 -- was free (it stays dirty and is drawn on release).
@@ -470,7 +528,7 @@ createBar env o out = do
     wlSurfaceCommit c surf
     modifyIORef' st $ \s -> s
       { sSurfs = M.insert surf sf { sfH = eHeight env } (sSurfs s)
-      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing [] Nothing) (sBars s)
+      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing [] []) (sBars s)
       , sOutputs = M.adjust (\x -> x { oBar = Just surf }) o (sOutputs s) }
   where
     c = eConn env
@@ -485,6 +543,8 @@ destroyBar :: Env -> Bar -> IO ()
 destroyBar env b = do
   mp <- sPopup <$> readIORef (eState env)
   forM_ mp $ \p -> when (pBar p == bSurface b) (closeMenu env)
+  mt <- sTip <$> readIORef (eState env)
+  forM_ mt $ \t -> when (tBar t == bSurface b) (closeTip env)
   zwlrLayerSurfaceV1Destroy (eConn env) (bLayer b)
   destroySurf env (bSurface b)
   modifyIORef' (eState env) $ \s -> s
@@ -494,11 +554,11 @@ destroyBar env b = do
 ------------------------------------------------------------------------------
 -- Drawing bars
 
--- | Draw a bar; returns its click areas, the areas that react to the
--- pointer, and the block showing its hover markup, if any.
-paintBar :: Env -> Canvas -> Output -> Maybe Double -> Maybe Int -> Double -> Double
-         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], Maybe Int)
-paintBar env cv out hoverX expanded w h = do
+-- | Draw a bar; returns its click areas, the areas whose look changes
+-- under the pointer, and the blocks with hover markup (for the popover).
+paintBar :: Env -> Canvas -> Output -> Maybe Double -> Double -> Double
+         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], [(Double, Double, String)])
+paintBar env cv out hoverX w h = do
   let cfg = eCfg env
       (ls, cs, rs) = eWidgets env
       hasIcon b = isJust (blockIcon b) || isJust (blockIconSource b)
@@ -523,13 +583,6 @@ paintBar env cv out hoverX expanded w h = do
   lb0 <- blocksOf ls
   cb0 <- blocksOf cs
   rb0 <- blocksOf rs
-  let allBlocks = concat (lb0 ++ cb0 ++ rb0)
-      hasHover i = maybe False (isJust . blockHoverMarkup) (listToMaybe (drop i allBlocks))
-      -- block number @mi@ (left to right) shows its hover markup
-      expand mi (a, b, c) = let (i1, a') = area 0 a; (i2, b') = area i1 b; (_, c') = area i2 c in (a', b', c')
-        where
-          area = mapAccumL (mapAccumL swap)
-          swap i blk = (i + 1 :: Int, if Just i == mi then blk { blockMarkup = fromMaybe (blockMarkup blk) (blockHoverMarkup blk) } else blk)
   withFont (font cfg) $ \fnt -> do
     let iconSize b = fromIntegral (if blockIconSize b > 0 then blockIconSize b else max 8 (round h - 8))
         iconPart b
@@ -554,51 +607,35 @@ paintBar env cv out hoverX expanded w h = do
         groupWidth g = sum [ bw | (_, _, (bw, _)) <- g ] + 2 * groupInset g
         totalWidth gs = sum (map groupWidth gs) + sp * fromIntegral (max 0 (length gs - 1))
         hovered x bw = maybe False (\hx -> hx >= x && hx < x + bw) hoverX
-        drawGroups x0 gs = fmap unzip' $ forM (zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs) $ \(gx, g) -> do
+        drawGroups x0 gs = fmap cat3 $ forM (zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs) $ \(gx, g) -> do
           forM_ (groupStyleOf g) $ \gs -> do
             let gst = if hovered gx (groupWidth g) then maybe gs (`mergeStyle` gs) (styleHover gs) else gs
             drawBox cv gst gx (groupWidth g) h
-          fmap unzip' $ forM (zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, th))) -> do
+          fmap cat3 $ forM (zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, th))) -> do
             let base = blockStyle b
                 st = if hovered x bw then maybe base (`mergeStyle` base) (styleHover base) else base
             ic <- blockBitmap b st (iconSize b)
             drawBlock cfg cv b { blockIcon = ic, blockStyle = st } l x bw h th (iconSize b)
             pure ( [ (x, x + bw, f) | Just f <- [blockOnClick b] ]
-                 , [ (x, x + bw) | isJust (styleHover base) || isJust (blockHoverMarkup b) ] )
-        unzip' xs = (concatMap fst xs, concatMap snd xs)
-        -- the slot of every block, in numbering order
-        blockRects x0 gs = concat
-          [ [ (x, bw) | (x, (_, _, (bw, _))) <- zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g ]
-          | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs ]
-        layout mi k = let (lb, cb, rb) = expand mi (lb0, cb0, rb0) in
-          measure lb $ \lgs -> measure cb $ \cgs -> measure rb $ \rgs -> do
-            let lw = totalWidth lgs
-                rw = totalWidth rgs
-                cw = totalWidth cgs
-                rx = w - pad - rw
-                cx = max (pad + lw + sp) (min (rx - sp - cw) ((w - cw) / 2))
-            k (lgs, cgs, rgs, cx, rx)
-        hoveredBlock (lgs, cgs, rgs, cx, rx) =
-          findIndex (uncurry hovered) (blockRects pad lgs ++ blockRects cx cgs ++ blockRects rx rgs)
-        draw ex (lgs, cgs, rgs, cx, rx) = do
-          (h1, r1) <- drawGroups pad lgs
-          (h2, r2) <- drawGroups cx cgs
-          (h3, r3) <- drawGroups rx rgs
-          -- hover areas also cover the boxes of whole widgets
-          let groupRects x0 gs = [ (gx, gx + groupWidth g)
-                                 | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
-                                 , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
-          pure (h1 ++ h2 ++ h3, r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs, ex)
-    -- The pointer is tested against what is on screen (with the block
-    -- expanded last time); if that changes which block shows its hover
-    -- markup, the bar is laid out again before drawing. An expanded block
-    -- keeps the pointer inside it (it grows towards the free space), so
-    -- there is no flicker at its edges.
-    layout expanded $ \g -> do
-      let ex = case hoveredBlock g of
-            Just i | hasHover i -> Just i
-            _ -> Nothing
-      if ex == expanded then draw ex g else layout ex (draw ex)
+                 , [ (x, x + bw) | isJust (styleHover base) ]
+                 , [ (x, x + bw, m) | Just m <- [blockHoverMarkup b], not (null m) ] )
+        cat3 xs = (concat [ a | (a, _, _) <- xs ], concat [ b | (_, b, _) <- xs ], concat [ c | (_, _, c) <- xs ])
+        -- hover areas also cover the boxes of whole widgets
+        groupRects x0 gs = [ (gx, gx + groupWidth g)
+                           | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
+                           , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
+    measure lb0 $ \lgs -> measure cb0 $ \cgs -> measure rb0 $ \rgs -> do
+      let lw = totalWidth lgs
+          rw = totalWidth rgs
+          cw = totalWidth cgs
+          rx = w - pad - rw
+          cx = max (pad + lw + sp) (min (rx - sp - cw) ((w - cw) / 2))
+      (h1, r1, t1) <- drawGroups pad lgs
+      (h2, r2, t2) <- drawGroups cx cgs
+      (h3, r3, t3) <- drawGroups rx rgs
+      pure ( h1 ++ h2 ++ h3
+           , r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs
+           , t1 ++ t2 ++ t3 )
   where
     safe act = act `E.catch` \(e :: E.SomeException) -> do
       hPutStrLn stderr ("waymobar: widget failed: " ++ show e)
@@ -655,9 +692,17 @@ drawBlock cfg cv b l x bw h th isz = do
 ------------------------------------------------------------------------------
 -- Menus
 
-menuPad, menuBorderW :: Double
-menuPad = 4
+menuPad, menuBorderW, menuInset :: Double
+menuPad = 5
 menuBorderW = 1
+menuInset = 5   -- between the panel's edge and the highlight of a row
+
+-- | The opacity of a menu now (it fades in like a popover).
+menuAlpha :: Config -> Popup -> Double -> Double
+menuAlpha cfg p now = case pStart p of
+  Just t0 | d > 0 -> 1 - (1 - max 0 (min 1 ((now - t0) / d))) ^ (3 :: Int)
+  _ -> 1
+  where d = fromIntegral (max 0 (popoverFade cfg)) / 1000 :: Double
 
 rowsFor :: [MenuEntry] -> [[MenuEntry]] -> [Row]
 rowsFor entries stack = (if null stack then [] else [RowBack]) ++ map RowEntry entries
@@ -674,7 +719,7 @@ isSeparator = \case
   RowEntry MenuSeparator -> True
   _ -> False
 
--- | Size of a menu and the y range of every row.
+-- | Size of a menu's surface (shadow included) and the y range of every row.
 measureMenu :: Config -> [Row] -> IO (Int, Int, [(Double, Double)])
 measureMenu cfg rows =
   allocaBytes 4 $ \p -> withCanvas p 1 1 1 $ \cv -> withFont (font cfg) $ \fnt ->
@@ -682,14 +727,15 @@ measureMenu cfg rows =
       sizes <- mapM layoutSize lays
       let lineH = fromIntegral (maximum (16 : map snd sizes)) + 8
           heights = [ if isSeparator r then 9 else lineH | r <- rows ]
-          ys = scanl (+) (menuBorderW + menuPad) heights
+          mg = fromIntegral tipMargin
+          ys = scanl (+) (mg + menuBorderW + menuPad) heights
           textW = fromIntegral (maximum (0 : map fst sizes))
-          w = 2 * menuBorderW + leftGutter rows + textW + 32
-          h = last ys + menuPad + menuBorderW
+          w = 2 * mg + 2 * menuBorderW + leftGutter rows + textW + 36
+          h = last ys + menuPad + menuBorderW + mg
       pure (ceiling w, ceiling h, zip ys (drop 1 ys))
 
 leftGutter :: [Row] -> Double
-leftGutter rows = 10 + (if any hasMark rows then 18 else 0) + (if any hasIcon rows then 22 else 0)
+leftGutter rows = 14 + (if any hasMark rows then 18 else 0) + (if any hasIcon rows then 22 else 0)
   where
     hasMark = \case
       RowEntry MenuItem { itemToggle = Just _ } -> True
@@ -698,9 +744,12 @@ leftGutter rows = 10 + (if any hasMark rows then 18 else 0) + (if any hasIcon ro
       RowEntry MenuItem { itemIcon = Just _ } -> True
       _ -> False
 
-openMenu :: Env -> ObjectId -> (Double, Double) -> [MenuEntry] -> [[MenuEntry]] -> IO ()
-openMenu env barSurf area entries stack = do
+-- | Open a menu under a block of a bar; it fades in if asked (not when
+-- moving between a menu and its submenus).
+openMenu :: Env -> ObjectId -> (Double, Double) -> [MenuEntry] -> [[MenuEntry]] -> Bool -> IO ()
+openMenu env barSurf area entries stack animate = do
   closeMenu env
+  closeTip env
   s <- readIORef st
   let g = sGlobals s
       cfg = eCfg env
@@ -712,18 +761,30 @@ openMenu env barSurf area entries stack = do
       forM_ msf $ \sf -> do
         let surf = sfSurface sf
             (x0, x1) = area
-            barH = maybe (eHeight env) sfH (M.lookup barSurf (sSurfs s))
+            barSf = M.lookup barSurf (sSurfs s)
+            barH = maybe (eHeight env) sfH barSf
+            mg = fromIntegral tipMargin
+            off = round tipGap - mg
+        -- only the panel takes input, not the room for its shadow
+        forM_ (gCompositor g) $ \(comp, _) -> do
+          region <- wlCompositorCreateRegion c comp
+          wlRegionAdd c region mg mg (fromIntegral w - 2 * mg) (fromIntegral h - 2 * mg)
+          wlSurfaceSetInputRegion c surf region
+          wlRegionDestroy c region
         xs <- xdgWmBaseGetXdgSurface c wm surf
         pos <- xdgWmBaseCreatePositioner c wm
         xdgPositionerSetSize c pos (fromIntegral w) (fromIntegral h)
         xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
+        -- the panel lines up with the left edge of the block
         if position cfg == Top
           then do
             xdgPositionerSetAnchor c pos xdgPositionerAnchorBottomLeft
             xdgPositionerSetGravity c pos xdgPositionerGravityBottomRight
+            xdgPositionerSetOffset c pos (negate mg) off
           else do
             xdgPositionerSetAnchor c pos xdgPositionerAnchorTopLeft
             xdgPositionerSetGravity c pos xdgPositionerGravityTopRight
+            xdgPositionerSetOffset c pos (negate mg) (negate off)
         xdgPositionerSetConstraintAdjustment c pos
           (xdgPositionerConstraintAdjustmentSlideX .|. xdgPositionerConstraintAdjustmentSlideY .|. xdgPositionerConstraintAdjustmentFlipY)
         popup <- xdgSurfaceGetPopup c xs nullObject pos
@@ -731,9 +792,13 @@ openMenu env barSurf area entries stack = do
         zwlrLayerSurfaceV1GetPopup c (bLayer bar) popup
         xdgPopupGrab c popup seat serial
         wlSurfaceCommit c surf
+        now <- getMonotonicTime
         modifyIORef' st $ \s' -> s'
-          { sSurfs = M.insert surf sf { sfW = w, sfH = h } (sSurfs s')
-          , sPopup = Just (Popup surf xs popup barSurf area rows ys stack Nothing 0) }
+          { sSurfs = M.insert surf sf { sfW = w, sfH = h
+                                      , sfScale120 = maybe 0 sfScale120 barSf
+                                      , sfBufScale = maybe 0 sfBufScale barSf } (sSurfs s')
+          , sPopup = Just (Popup surf xs popup barSurf area rows ys stack Nothing 0
+                             (if animate then Just now else Nothing) Nothing) }
     _ -> pure ()
   where
     c = eConn env
@@ -748,45 +813,48 @@ closeMenu env = do
     destroySurf env (pSurface p)
     modifyIORef' (eState env) $ \s -> s { sPopup = Nothing }
 
-paintMenu :: Env -> Canvas -> Popup -> Double -> Double -> IO ()
-paintMenu env cv p w h = do
+paintMenu :: Env -> Canvas -> Popup -> Double -> Double -> Double -> IO ()
+paintMenu env cv p alpha w h = do
   let cfg = eCfg env
       fg = color (fgColor cfg)
       dim = let Color r g b a = fg in Color r g b (a * 0.4)
-      gutter = leftGutter (pRows p)
-      markX = 10
-      iconX = if any isMark (pRows p) then 28 else 10
-  clear cv (color (menuBorder cfg))
-  setColor cv (color (bgColor cfg))
-  fillRect cv menuBorderW menuBorderW (w - 2 * menuBorderW) (h - 2 * menuBorderW)
-  withFont (font cfg) $ \fnt ->
-    withLayouts cv fnt (map (escapeMarkup . rowLabel) (pRows p)) $ \lays ->
-      forM_ (zip3 [0 ..] (pRows p) (zip lays (pLayout p))) $ \(i, row, (l, (y0, y1))) ->
-        if isSeparator row
-          then do
-            setColor cv (color (menuBorder cfg))
-            fillRect cv (menuBorderW + 6) (fromIntegral (round ((y0 + y1) / 2) :: Int)) (w - 2 * menuBorderW - 12) 1
-          else do
-            let enabled = rowEnabled row
-            when (pHover p == Just i && enabled) $ do
-              setColor cv (color (menuHighlight cfg))
-              fillRect cv menuBorderW y0 (w - 2 * menuBorderW) (y1 - y0)
-            (_, th) <- layoutSize l
-            let ty = fromIntegral (round (y0 + (y1 - y0 - fromIntegral th) / 2) :: Int)
-            setColor cv (if enabled then fg else dim)
-            case row of
-              RowEntry MenuItem { itemToggle = Just True } ->
-                withMarkup cv fnt "✓" $ \m -> showLayout cv m markX ty
-              _ -> pure ()
-            case row of
-              RowEntry MenuItem { itemIcon = Just icon } ->
-                drawIcon cv icon iconX (y0 + (y1 - y0 - 16) / 2) 16
-              _ -> pure ()
-            setColor cv (if enabled then fg else dim)
-            showLayout cv l gutter ty
-            case row of
-              RowEntry (Submenu _ _) -> withMarkup cv fnt "›" $ \m -> showLayout cv m (w - 18) ty
-              _ -> pure ()
+      mg = fromIntegral tipMargin
+      (px, pw) = (mg, w - 2 * mg)
+      gutter = px + leftGutter (pRows p)
+      markX = px + 14
+      iconX = px + (if any isMark (pRows p) then 32 else 14)
+      dir = if position cfg == Top then -1 else 1
+  clear cv (Color 0 0 0 0)
+  withFade cv alpha (dir * tipSlide * (1 - alpha)) $ do
+    drawPanel cfg cv px mg pw (h - 2 * mg)
+    withFont (font cfg) $ \fnt ->
+      withLayouts cv fnt (map (escapeMarkup . rowLabel) (pRows p)) $ \lays ->
+        forM_ (zip3 [0 ..] (pRows p) (zip lays (pLayout p))) $ \(i, row, (l, (y0, y1))) ->
+          if isSeparator row
+            then do
+              setColor cv (color (menuBorder cfg))
+              fillRect cv (px + 12) (fromIntegral (round ((y0 + y1) / 2) :: Int)) (pw - 24) 1
+            else do
+              let enabled = rowEnabled row
+              when (pHover p == Just i && enabled) $ do
+                setColor cv (color (menuHighlight cfg))
+                fillRounded cv (px + menuInset) y0 (pw - 2 * menuInset) (y1 - y0) (max 0 (popoverRadius cfg - menuInset))
+              (_, th) <- layoutSize l
+              let ty = fromIntegral (round (y0 + (y1 - y0 - fromIntegral th) / 2) :: Int)
+              setColor cv (if enabled then fg else dim)
+              case row of
+                RowEntry MenuItem { itemToggle = Just True } ->
+                  withMarkup cv fnt "✓" $ \m -> showLayout cv m markX ty
+                _ -> pure ()
+              case row of
+                RowEntry MenuItem { itemIcon = Just icon } ->
+                  drawIcon cv icon iconX (y0 + (y1 - y0 - 16) / 2) 16
+                _ -> pure ()
+              setColor cv (if enabled then fg else dim)
+              showLayout cv l gutter ty
+              case row of
+                RowEntry (Submenu _ _) -> withMarkup cv fnt "›" $ \m -> showLayout cv m (px + pw - 22) ty
+                _ -> pure ()
   where
     isMark = \case
       RowEntry MenuItem { itemToggle = Just _ } -> True
@@ -807,14 +875,177 @@ activateRow env p i = case drop i (pRows p) of
       closeMenu env
       void $ forkIO $ void $ E.try @E.SomeException act
     RowEntry (Submenu _ es) ->
-      openMenu env (pBar p) (pArea p) es (currentEntries : pStack p)
+      openMenu env (pBar p) (pArea p) es (currentEntries : pStack p) False
     RowBack -> case pStack p of
-      (parent : rest) -> openMenu env (pBar p) (pArea p) parent rest
+      (parent : rest) -> openMenu env (pBar p) (pArea p) parent rest False
       [] -> pure ()
     RowEntry MenuSeparator -> pure ()
   _ -> pure ()
   where
     currentEntries = [ e | RowEntry e <- pRows p ]
+
+------------------------------------------------------------------------------
+-- Popovers (hover markup)
+
+-- | Transparent room around the panel of a popover, for its shadow.
+tipMargin :: Int
+tipMargin = 18
+
+tipPadX, tipPadY, tipGap, tipSlide :: Double
+tipPadX = 12
+tipPadY = 8
+tipGap = 6     -- between the bar and the panel
+tipSlide = 6   -- how far the panel travels while it fades in
+
+-- | The size of the popover's surface (shadow included) for some markup.
+measureTip :: Config -> String -> IO (Int, Int)
+measureTip cfg m =
+  allocaBytes 4 $ \p -> withCanvas p 1 1 1 $ \cv -> withFont (font cfg) $ \fnt ->
+    withMarkup cv fnt m $ \l -> do
+      (tw, th) <- layoutSize l
+      pure ( tw + 2 * (ceiling tipPadX + tipMargin), th + 2 * (ceiling tipPadY + tipMargin) )
+
+-- | The opacity of a popover now: an ease-out from 'tFrom' to 'tTo'.
+tipAlpha :: Config -> Tip -> Double -> Double
+tipAlpha cfg t now = tFrom t + (tTo t - tFrom t) * (1 - (1 - p) ^ (3 :: Int))
+  where
+    d = tipDuration cfg t
+    p = if d <= 0 then 1 else max 0 (min 1 ((now - tStart t) / d))
+
+-- | Seconds a fade takes; going away is quicker than showing up.
+tipDuration :: Config -> Tip -> Double
+tipDuration cfg t = fromIntegral (max 0 (popoverFade cfg)) / 1000 * (if tTo t == 0 then 0.7 else 1)
+
+-- | Open, update or close the popover after what is under the pointer.
+syncTip :: Env -> IO ()
+syncTip env = do
+  s <- readIORef st
+  now <- getMonotonicTime
+  let cfg = eCfg env
+      -- no popovers while a menu is open
+      want = if isJust (sPopup s) then Nothing else listToMaybe
+        [ (bSurface b, (x0, x1), m)
+        | se <- M.elems (sSeats s), Just f <- [sFocus se], Just b <- [M.lookup f (sBars s)]
+        , (x0, x1, m) <- bTips b, sX se >= x0, sX se < x1 ]
+      set t = modifyIORef' st $ \x -> x
+        { sTip = Just t, sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (tSurface t) (sSurfs x) }
+      fadeTo t to = t { tFrom = tipAlpha cfg t now, tTo = to, tStart = now }
+  case (sTip s, want) of
+    (Nothing, Nothing) -> pure ()
+    (Nothing, Just (b, a, m)) -> openTip env b a m 0
+    (Just t, Nothing)
+      | tTo t == 0 -> when (now - tStart t >= tipDuration cfg t) (closeTip env)
+      | otherwise -> do
+          let t' = fadeTo t 0
+          set t'
+          -- frame callbacks stop if the surface is hidden: make sure it goes
+          void $ forkIO $ threadDelay (round (tipDuration cfg t' * 1000000) + 20000) >> ePush env MsgTick
+    (Just t, Just (b, a, m))
+      -- another block: the new popover starts as visible as this one was,
+      -- so moving along the bar switches them at once (like a menu bar)
+      | tBar t /= b || tArea t /= a -> closeTip env >> openTip env b a m (tipAlpha cfg t now)
+      | tMarkup t /= m -> do
+          size <- measureTip cfg m
+          if Just size == ((\sf -> (sfW sf, sfH sf)) <$> M.lookup (tSurface t) (sSurfs s))
+            then set (fadeTo t 1) { tMarkup = m }
+            else closeTip env >> openTip env b a m (tipAlpha cfg t now)
+      | tTo t == 0 -> set (fadeTo t 1)
+      | otherwise -> pure ()
+  where st = eState env
+
+-- | A popover for a block of a bar, starting at the given opacity.
+openTip :: Env -> ObjectId -> (Double, Double) -> String -> Double -> IO ()
+openTip env barSurf area@(x0, x1) m from = do
+  s <- readIORef st
+  let g = sGlobals s
+      cfg = eCfg env
+  case (gWmBase g, gCompositor g, M.lookup barSurf (sBars s)) of
+    (Just wm, Just (comp, _), Just bar) -> do
+      (w, h) <- measureTip cfg m
+      msf <- newSurf env (bOutput bar)
+      forM_ msf $ \sf -> do
+        let surf = sfSurface sf
+            barSf = M.lookup barSurf (sSurfs s)
+            barH = maybe (eHeight env) sfH barSf
+            -- the shadow's room overlaps the bar: only the gap separates
+            -- the panel from it
+            off = round tipGap - tipMargin
+        -- no input: the pointer goes through to whatever is below
+        region <- wlCompositorCreateRegion c comp
+        wlSurfaceSetInputRegion c surf region
+        wlRegionDestroy c region
+        xs <- xdgWmBaseGetXdgSurface c wm surf
+        pos <- xdgWmBaseCreatePositioner c wm
+        xdgPositionerSetSize c pos (fromIntegral w) (fromIntegral h)
+        xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
+        -- centred on the block
+        if position cfg == Top
+          then do
+            xdgPositionerSetAnchor c pos xdgPositionerAnchorBottom
+            xdgPositionerSetGravity c pos xdgPositionerGravityBottom
+            xdgPositionerSetOffset c pos 0 (fromIntegral off)
+          else do
+            xdgPositionerSetAnchor c pos xdgPositionerAnchorTop
+            xdgPositionerSetGravity c pos xdgPositionerGravityTop
+            xdgPositionerSetOffset c pos 0 (fromIntegral (negate off))
+        xdgPositionerSetConstraintAdjustment c pos xdgPositionerConstraintAdjustmentSlideX
+        popup <- xdgSurfaceGetPopup c xs nullObject pos
+        xdgPositionerDestroy c pos
+        zwlrLayerSurfaceV1GetPopup c (bLayer bar) popup
+        wlSurfaceCommit c surf
+        now <- getMonotonicTime
+        modifyIORef' st $ \s' -> s'
+          { -- the bar's scale is the best guess until the compositor says
+            sSurfs = M.insert surf sf { sfW = w, sfH = h
+                                      , sfScale120 = maybe 0 sfScale120 barSf
+                                      , sfBufScale = maybe 0 sfBufScale barSf } (sSurfs s')
+          , sTip = Just (Tip surf xs popup barSurf area m from 1 now Nothing) }
+    _ -> pure ()
+  where
+    c = eConn env
+    st = eState env
+
+closeTip :: Env -> IO ()
+closeTip env = do
+  mt <- sTip <$> readIORef (eState env)
+  forM_ mt $ \t -> do
+    xdgPopupDestroy (eConn env) (tPopup t)
+    xdgSurfaceDestroy (eConn env) (tXdgSurf t)
+    destroySurf env (tSurface t)
+    modifyIORef' (eState env) $ \s -> s { sTip = Nothing }
+
+-- | The popover: its markup on a panel, at the given opacity; it slides
+-- away from the bar into its place as it appears.
+paintTip :: Env -> Canvas -> Tip -> Double -> Double -> Double -> IO ()
+paintTip env cv t alpha w h = do
+  let cfg = eCfg env
+      mg = fromIntegral tipMargin
+      dir = if position cfg == Top then -1 else 1
+  clear cv (Color 0 0 0 0)
+  withFade cv alpha (dir * tipSlide * (1 - alpha)) $ do
+    drawPanel cfg cv mg mg (w - 2 * mg) (h - 2 * mg)
+    setColor cv (color (fgColor cfg))
+    withFont (font cfg) $ \fnt -> withMarkup cv fnt (tMarkup t) $ \l ->
+      showLayout cv l (mg + tipPadX) (mg + tipPadY)
+
+-- | The rounded panel of popovers and menus, with a soft shadow around it
+-- (which needs 'tipMargin' of room at every side).
+drawPanel :: Config -> Canvas -> Double -> Double -> Double -> Double -> IO ()
+drawPanel cfg cv px py pw ph = do
+  let r = popoverRadius cfg
+      spread = 14 :: Int
+  -- the shadow: thin layers, each a pixel smaller, falling a bit below
+  forM_ [spread, spread - 1 .. 1] $ \k -> do
+    let d = fromIntegral k
+        fall = 1 - (d - 1) / fromIntegral spread
+    setColor cv (Color 0 0 0 (0.05 * fall * fall))
+    fillRounded cv (px - d) (py - d + 3) (pw + 2 * d) (ph + 2 * d) (r + d)
+  -- the panel replaces the shadow under it, so a see-through background
+  -- shows what is behind it, not a dark smudge
+  setColor cv (color (fromMaybe (bgColor cfg) (popoverBg cfg)))
+  fillRoundedReplace cv px py pw ph r
+  setColor cv (color (menuBorder cfg))
+  strokeRounded cv px py pw ph r 1
 
 ------------------------------------------------------------------------------
 -- Pointer

@@ -55,7 +55,7 @@ library
     Waymobar.Widgets
     Waymobar.Wayland.Protocol
     Waymobar.Wayland.Wire
-  c-sources:        cbits/waymobar.c, cbits/icons.c, cbits/pulse.c, cbits/net.c
+  c-sources:        cbits/waymobar.c, cbits/icons.c, cbits/pulse.c, cbits/net.c, cbits/text.c
   pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0, libpulse
   build-depends:
       base        >=4.16 && <5

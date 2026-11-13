@@ -9,6 +9,8 @@ module Waymobar.Draw
   , fillRect
   , fillRounded
   , strokeRounded
+  , fillRoundedReplace
+  , withFade
   , clear
     -- * Text
   , Font
@@ -102,6 +104,13 @@ foreign import ccall unsafe "cairo_get_source"
 foreign import ccall unsafe "cairo_pattern_set_filter"
   c_pattern_set_filter :: Ptr () -> CInt -> IO ()
 
+foreign import ccall unsafe "cairo_push_group"
+  c_push_group :: Ptr Cairo -> IO ()
+foreign import ccall unsafe "cairo_pop_group_to_source"
+  c_pop_group_to_source :: Ptr Cairo -> IO ()
+foreign import ccall unsafe "cairo_paint_with_alpha"
+  c_paint_with_alpha :: Ptr Cairo -> CDouble -> IO ()
+
 foreign import ccall unsafe "pango_cairo_create_layout"
   c_create_layout :: Ptr Cairo -> IO (Ptr PangoLayout)
 foreign import ccall unsafe "pango_cairo_show_layout"
@@ -116,6 +125,8 @@ foreign import ccall unsafe "pango_layout_set_font_description"
   c_set_font :: Ptr PangoLayout -> Ptr PangoFontDescription -> IO ()
 foreign import ccall unsafe "pango_layout_set_markup"
   c_set_markup :: Ptr PangoLayout -> CString -> CInt -> IO ()
+foreign import ccall unsafe "waymobar_align_tabs"
+  c_align_tabs :: Ptr PangoLayout -> CInt -> IO ()
 foreign import ccall unsafe "pango_layout_get_pixel_size"
   c_pixel_size :: Ptr PangoLayout -> Ptr CInt -> Ptr CInt -> IO ()
 foreign import ccall unsafe "pango_parse_markup"
@@ -170,6 +181,8 @@ withFont desc act =
   bracket (B.useAsCString (utf8 desc) c_font_from_string) c_font_free (act . Font)
 
 -- | A laid out piece of pango markup. Invalid markup is shown as text.
+-- Tabs make columns: in text of several lines, what follows the first tab
+-- of every line starts at the same place (and so on for the next tabs).
 withMarkup :: Canvas -> Font -> String -> (TextLayout -> IO a) -> IO a
 withMarkup (Canvas cr) (Font f) markup act =
   bracket (c_create_layout cr) c_unref $ \l -> do
@@ -177,6 +190,7 @@ withMarkup (Canvas cr) (Font f) markup act =
     ok <- validMarkup markup
     let m = if ok then markup else escapeMarkup markup
     B.useAsCString (utf8 m) $ \s -> c_set_markup l s (-1)
+    c_align_tabs l 14
     act (TextLayout l)
 
 -- | Width and height in (logical) pixels.
@@ -278,3 +292,25 @@ strokeRounded (Canvas cr) x y w h r lw = do
   roundedPath cr (x + i) (y + i) (w - lw) (h - lw) (max 0 (r - i))
   c_set_line_width cr (realToFrac lw)
   c_stroke cr
+
+-- | Like 'fillRounded', but the colour replaces what is below it (alpha
+-- included) instead of being blended over it.
+fillRoundedReplace :: Canvas -> Double -> Double -> Double -> Double -> Double -> IO ()
+fillRoundedReplace (Canvas cr) x y w h r = do
+  roundedPath cr x y w h r
+  c_set_operator cr 1 -- CAIRO_OPERATOR_SOURCE
+  c_fill cr
+  c_set_operator cr 2 -- CAIRO_OPERATOR_OVER
+
+-- | Draw everything in the action as one layer, moved @dy@ down and
+-- blended with opacity @alpha@: one step of a fade (and slide) animation.
+withFade :: Canvas -> Double -> Double -> IO a -> IO a
+withFade (Canvas cr) alpha dy act = do
+  c_push_group cr
+  c_save cr
+  c_translate cr 0 (realToFrac dy)
+  r <- act
+  c_restore cr
+  c_pop_group_to_source cr
+  c_paint_with_alpha cr (realToFrac (max 0 (min 1 alpha)))
+  pure r

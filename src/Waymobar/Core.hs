@@ -55,7 +55,13 @@ data Config = Config
   , outputs       :: [String]  -- ^ outputs to show a bar on (by name, e.g. @"DP-1"@); [] = all
   , namespace     :: String    -- ^ layer-shell namespace, for compositor rules
   , menuHighlight :: String    -- ^ background of the menu entry under the pointer
-  , menuBorder    :: String    -- ^ border of menus
+  , menuBorder    :: String    -- ^ border of menus and popovers
+  , popoverBg     :: Maybe String
+    -- ^ background of menus and of the popovers that show a block's hover
+    -- markup ('Nothing' = 'bgColor'; give an opaque colour if the bar is
+    -- see-through)
+  , popoverRadius :: Double    -- ^ rounded corners of menus and popovers
+  , popoverFade   :: Int       -- ^ milliseconds they take to fade in; 0 = no animation
   }
 
 -- | An empty bar; "Waymobar.Config" has a populated 'def'.
@@ -80,6 +86,9 @@ defaultConfig = Config
   , namespace = "waymobar"
   , menuHighlight = "#434c5e"
   , menuBorder = "#4c566a"
+  , popoverBg = Nothing
+  , popoverRadius = 10
+  , popoverFade = 140
   }
 
 -- | An output name, such as @"DP-1"@ (empty if the compositor did not say).
@@ -168,7 +177,7 @@ data Block = Block
   , blockIconColor      :: Maybe String      -- ^ colour for symbolic icons; 'Nothing' = the text colour
   , blockIconRecolorAll :: Bool              -- ^ recolour every icon, not only @-symbolic@ ones
   , blockGroupStyle     :: Maybe Style       -- ^ a box behind all the blocks of the widget (from its first block)
-  , blockHoverMarkup    :: Maybe String      -- ^ shown instead of 'blockMarkup' while the pointer is on the block
+  , blockHoverMarkup    :: Maybe String      -- ^ shown in a popover under the block while the pointer is on it (may have several lines)
   }
 
 -- | A block showing some markup, without padding or click handler.

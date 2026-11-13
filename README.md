@@ -110,7 +110,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `commandReader cmd` | last line printed by a long-running command (markup) |
 | `tray defaultTray` | system tray (see below) |
 | `volume f` | volume of the default output, live (see below) |
-| `network secs f` | connection, Wi-Fi network and signal, IP, traffic |
+| `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
 | `weather cfg f` | the current weather, from Open-Meteo (see below) |
 | `text markup` | fixed text |
@@ -123,10 +123,35 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 greedyView) and `scrollCycles`.
 
 Combinators: `colored "#hex"`, `withStyle`, `padded n`, `markup f`,
-`hoverMarkup f` (other markup while the pointer is on the widget: it grows
-in place, like a tooltip inside the bar), `onClick (\c -> ...)`,
+`hoverMarkup f` (a popover with other markup while the pointer is on the
+widget, see below), `onClick (\c -> ...)`,
 `spawnOnClick "cmd"`. Text is pango markup; use `escape` for untrusted
 strings.
+
+### Popovers
+
+A block with hover markup (`hoverMarkup`, `weatherHover`, `networkHover`,
+or `blockHoverMarkup` in your own widgets) opens a popover under it while
+the pointer is on it: a rounded panel with a soft shadow that fades in,
+for the details that don't fit in the bar. The markup may have several
+lines, and tabs make columns: what follows the first tab of every line
+starts at the same place (`"IP address\t192.168.1.115\nRouter\t192.168.1.1"`). The popover takes no input (the pointer stays on the bar), and
+moving along the bar switches from one to the next at once.
+
+```haskell
+hoverMarkup (const "<b>Log out</b>\nends the rivermonad session") (logoutButton "⏻")
+```
+
+It uses `fgColor` and `menuBorder`, and these fields of the configuration:
+
+| Field | |
+|---|---|
+| `popoverBg` | background; `Nothing` (the default) = `bgColor`. Give an opaque colour if the bar is see-through |
+| `popoverRadius` | rounded corners (10) |
+| `popoverFade` | milliseconds of the fade (140); 0 = no animation |
+
+The shadow and the fade are drawn by waymobar itself, so they look the
+same in every compositor.
 
 ### Icons
 
@@ -232,9 +257,12 @@ limit). `toggleMute` and `changeVolume` are exported for your own handlers;
 `Nothing` when offline, or a `NetInfo` with `netInterface`, `netKind`
 (`Wifi`, `Ethernet`, `OtherNet`), `netName` (the Wi-Fi network or the
 NetworkManager connection), `netSignal` (Wi-Fi, percent), `netAddress`
-(IPv4) and `netRxRate`/`netTxRate` (bytes per second; `formatRate` prints
-them). The name and signal come from NetworkManager over the system bus
-when it runs; the rest from the kernel.
+(IPv4), `netAddress6` (IPv6, not the link-local one), `netGateway` (the
+router), `netFrequency` (Wi-Fi, MHz), `netBitrate` (Wi-Fi link speed,
+Mbit/s) and `netRxRate`/`netTxRate` (bytes per second; `formatRate` prints
+them). The name, signal, frequency and link speed come from NetworkManager
+over the system bus when it runs; the rest from the kernel. On IPv6-only
+networks the interface is the one of the IPv6 default route.
 
 ```haskell
 network 3 $ \case
@@ -244,19 +272,23 @@ network 3 $ \case
     _    -> maybe (netInterface n) id (netAddress n)
 ```
 
-### Media players
+`networkHover secs f g` is the same with a second function, for the markup
+of the [popover](#popovers) shown while the pointer is on the widget.
+`networkDetails` is a ready-made one: the network and its signal, the band
+and channel, the addresses, the router, the link speed and the traffic.
 
-`mpris f` shows one MPRIS player (Spotify, Firefox, Chromium, VLC, mpv
-with mpv-mpris...): the one playing, or else the one that changed last;
-hidden when there is none. `f` gets a `Media` with `mediaPlayer`,
-`mediaStatus` (`Playing`, `Paused`, `Stopped`), `mediaTitle`,
-`mediaArtist` and `mediaAlbum`; escape them, they are plain text. Left
-click plays/pauses, right click skips to the next track, middle click goes
-back.
+`wifiMenu w` makes a left click on the widget open a menu like the Wi-Fi
+one of macOS: the network in use (checked), the other known networks in
+range, the rest under "Other Networks", and a switch for the Wi-Fi radio.
+Choosing a network connects to it. It needs NetworkManager's `nmcli`; a
+network with a password that NetworkManager does not know yet has to be
+joined once by other means (`nmcli --ask device wifi connect NAME`).
 
 ```haskell
-mpris $ \m -> (if mediaStatus m == Playing then "▶ " else "⏸ ")
-             ++ escape (shorten 50 (mediaArtist m ++ " - " ++ mediaTitle m))
+wifiMenu $ networkHover 3 label (maybe "" networkDetails)
+  where
+    label Nothing = "offline"
+    label (Just n) = maybe (netInterface n) escape (netName n)
 ```
 
 ### Weather
@@ -268,8 +300,8 @@ set `weatherLocation`: `City "Madrid"` (Open-Meteo's geocoder),
 public IP address, through ip-api.com). `weatherUnits` is `Metric` (°C,
 km/h) or `Imperial` (°F, mph); `weatherInterval` defaults to 900 seconds,
 and a left click refreshes (`weatherClickRefreshes`). `weatherHover` gives
-the markup shown while the pointer is on the widget, for the details that
-don't fit in the bar.
+the markup of the [popover](#popovers) shown while the pointer is on the
+widget, for the details that don't fit in the bar.
 
 `f` gets `Nothing` until the first answer (and after a long outage; the
 last reading survives short ones), or a `Weather` with `weatherPlace`,
@@ -282,8 +314,10 @@ words.
 ```haskell
 weather defaultWeather
   { weatherLocation = City "Madrid"
-  , weatherHover = \w -> escape (weatherDescription w) ++ ", feels like " ++ show (weatherFeelsLike w)
-                        ++ "°, " ++ show (weatherTempMin w) ++ "–" ++ show (weatherTempMax w) ++ "°"
+  , weatherHover = \w -> "<b>" ++ escape (weatherPlace w) ++ "</b>  " ++ escape (weatherDescription w)
+                        ++ "\nfeels like " ++ show (weatherFeelsLike w) ++ "°, "
+                        ++ show (weatherTempMin w) ++ "–" ++ show (weatherTempMax w) ++ "°"
+                        ++ "\nhumidity " ++ show (weatherHumidity w) ++ "%, wind " ++ show (weatherWind w) ++ " km/h"
   } $ \case
   Nothing -> ""
   Just w -> weatherIcon w ++ " " ++ show (weatherTemp w) ++ "°"
@@ -320,8 +354,9 @@ power = onClick (\c -> clickMenu c
 ```
 
 `MenuItem` also has `itemEnabled`, `itemToggle` (a check mark) and
-`itemIcon`. Menus use `bgColor`, `fgColor`, `menuHighlight` and
-`menuBorder`. A menu closes when an entry is chosen, when the bar is clicked
+`itemIcon`. Menus look like [popovers](#popovers) (the same rounded panel,
+shadow and fade, with `popoverBg`, `popoverRadius` and `popoverFade`), and
+use `fgColor`, `menuHighlight` and `menuBorder`. A menu closes when an entry is chosen, when the bar is clicked
 or when the pointer leaves it for a moment.
 
 ### Writing a widget

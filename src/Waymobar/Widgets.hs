@@ -4,6 +4,7 @@ module Waymobar.Widgets
     text
   , periodic
   , periodicIO
+  , periodicHoverIO
   , clock
   , command
   , commandMarkup
@@ -73,16 +74,22 @@ periodic secs act = periodicIO secs (pure act)
 -- | Like 'periodic', with a setup action that can keep state between
 -- samples (see 'cpu').
 periodicIO :: Double -> IO (IO String) -> Widget
-periodicIO secs setup = Widget $ \env -> do
+periodicIO secs setup = periodicHoverIO secs (fmap (\s -> (s, "")) <$> setup)
+
+-- | Like 'periodicIO', but every sample is the markup of the bar and the
+-- markup of the popover shown while the pointer is on the widget (@""@ =
+-- no popover).
+periodicHoverIO :: Double -> IO (IO (String, String)) -> Widget
+periodicHoverIO secs setup = Widget $ \env -> do
   act <- setup
-  ref <- newIORef ""
+  ref <- newIORef ("", "")
   void $ forkIO $ forever $ do
     r <- E.try act
-    let s = either (\e -> const "" (e :: E.SomeException)) id r
+    let s = either (\e -> const ("", "") (e :: E.SomeException)) id r
     old <- atomicModifyIORef' ref (\o -> (s, o))
     unless (s == old) (redraw env)
     threadDelay (round (secs * 1000000))
-  pure $ \_ -> (\s -> [block s | not (null s)]) <$> readIORef ref
+  pure $ \_ -> (\(s, h) -> [ (block s) { blockHoverMarkup = if null h then Nothing else Just h } | not (null s) ]) <$> readIORef ref
 
 -- | The local time, with a 'formatTime' format such as @"%a %d %b %H:%M"@.
 -- Updates on the second.
@@ -374,11 +381,10 @@ padded p = mapBlocks (\b -> b { blockPadding = blockPadding b + p })
 markup :: (String -> String) -> Widget -> Widget
 markup f = mapBlocks (\b -> b { blockMarkup = f (blockMarkup b) })
 
--- | Markup shown instead of the block's own while the pointer is on it,
--- computed from the normal markup: the block grows in place (like a
--- tooltip, but inside the bar).
+-- | Markup shown in a popover under the block while the pointer is on it,
+-- computed from the block's own markup. It may have several lines.
 --
--- > hoverMarkup (++ " – click to log out") (logoutButton "⏻")
+-- > hoverMarkup (const "<b>Log out</b>\nends the session") (logoutButton "⏻")
 hoverMarkup :: (String -> String) -> Widget -> Widget
 hoverMarkup f = mapBlocks (\b -> b { blockHoverMarkup = Just (f (blockMarkup b)) })
 

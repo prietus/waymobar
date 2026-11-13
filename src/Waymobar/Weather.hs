@@ -54,8 +54,9 @@ data WeatherConfig = WeatherConfig
   , weatherInterval :: Double   -- ^ seconds between updates; Open-Meteo's current weather changes every 15 minutes
   , weatherClickRefreshes :: Bool  -- ^ a left click fetches the weather now
   , weatherHover    :: Weather -> String
-    -- ^ markup shown instead while the pointer is on the widget (@""@ = none):
-    -- the place, feels-like, min/max, humidity, wind...
+    -- ^ markup of the popover shown while the pointer is on the widget
+    -- (@""@ = none; it may have several lines): the place, feels-like,
+    -- min/max, humidity, wind...
   }
 
 -- | Located from the IP address, metric, every 15 minutes.
