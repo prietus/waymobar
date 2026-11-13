@@ -5,12 +5,13 @@ xmobar. It is the native bar for [rivermonad](https://github.com/prietus/rivermo
 workspaces, layout and window title come straight from rivermonad's IPC
 socket, and clicking them acts on rivermonad.
 
-![waymobar with the pill theme: workspaces, layout, window title, media, network, volume, CPU, memory, clock and log out](docs/bar.png)
+![waymobar with the pill theme: workspaces, layout, network, weather with its popover open, volume, CPU, memory, clock and log out](docs/bar.png)
 
-![Clicking workspaces and cycling layouts from the bar](docs/bar.gif)
+![Popovers of the network and the weather, the log out menu and cycling layouts from the bar](docs/bar.gif)
 
 *The pill theme from the [example dotfiles](https://github.com/prietus/rivermonad/tree/main/examples/dotfiles)
-at scale 2: hover highlights, workspaces and layouts switched by clicking.
+at scale 2: popovers with the details of the network and the weather, the
+log out menu, hover highlights and layouts switched by clicking.
 See it in a whole desktop in [rivermonad's demo](https://github.com/prietus/rivermonad#rivermonad).*
 
 * pure-Haskell Wayland client (`Waymobar.Wayland.Wire`, bindings generated
