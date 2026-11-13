@@ -44,7 +44,7 @@ From source:
 ```sh
 sudo apt install libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libpulse-dev   # plus ghc and cabal-install
 cd waymobar
-cabal install --lib waymobar      # so ghc can compile your config
+cabal install --lib lib:waymobar  # so ghc can compile your config (--force-reinstalls when upgrading)
 cabal install exe:waymobar
 ```
 
@@ -112,6 +112,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `volume f` | volume of the default output, live (see below) |
 | `network secs f` | connection, Wi-Fi network and signal, IP, traffic |
 | `mpris f` | the current media player (see below) |
+| `weather cfg f` | the current weather, from Open-Meteo (see below) |
 | `text markup` | fixed text |
 | `periodic secs io` | any `IO String` (`readCommand` gives a command's first line) |
 
@@ -122,8 +123,10 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 greedyView) and `scrollCycles`.
 
 Combinators: `colored "#hex"`, `withStyle`, `padded n`, `markup f`,
-`onClick (\c -> ...)`, `spawnOnClick "cmd"`. Text is pango markup; use
-`escape` for untrusted strings.
+`hoverMarkup f` (other markup while the pointer is on the widget: it grows
+in place, like a tooltip inside the bar), `onClick (\c -> ...)`,
+`spawnOnClick "cmd"`. Text is pango markup; use `escape` for untrusted
+strings.
 
 ### Icons
 
@@ -254,6 +257,36 @@ back.
 ```haskell
 mpris $ \m -> (if mediaStatus m == Playing then "▶ " else "⏸ ")
              ++ escape (shorten 50 (mediaArtist m ++ " - " ++ mediaTitle m))
+```
+
+### Weather
+
+`weather cfg f` shows the current weather from [Open-Meteo](https://open-meteo.com)
+(free, no API key; fetched with `curl`). Start from `defaultWeather` and
+set `weatherLocation`: `City "Madrid"` (Open-Meteo's geocoder),
+`Coords 40.42 (-3.70)`, or `AutoLocation` (the default: the place of your
+public IP address, through ip-api.com). `weatherUnits` is `Metric` (°C,
+km/h) or `Imperial` (°F, mph); `weatherInterval` defaults to 900 seconds,
+and a left click refreshes (`weatherClickRefreshes`). `weatherHover` gives
+the markup shown while the pointer is on the widget, for the details that
+don't fit in the bar.
+
+`f` gets `Nothing` until the first answer (and after a long outage; the
+last reading survives short ones), or a `Weather` with `weatherPlace`,
+`weatherTemp`, `weatherFeelsLike`, `weatherTempMin`/`weatherTempMax`
+(today), `weatherHumidity`, `weatherWind`, `weatherCode` (WMO) and
+`weatherIsDay`. `weatherIcon` picks a Nerd Font glyph for the code (day or
+night), `weatherEmoji` a colour emoji, and `weatherDescription` says it in
+words.
+
+```haskell
+weather defaultWeather
+  { weatherLocation = City "Madrid"
+  , weatherHover = \w -> escape (weatherDescription w) ++ ", feels like " ++ show (weatherFeelsLike w)
+                        ++ "°, " ++ show (weatherTempMin w) ++ "–" ++ show (weatherTempMax w) ++ "°"
+  } $ \case
+  Nothing -> ""
+  Just w -> weatherIcon w ++ " " ++ show (weatherTemp w) ++ "°"
 ```
 
 ### System tray

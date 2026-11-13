@@ -51,6 +51,7 @@ library
     Waymobar.Recompile
     Waymobar.Rivermonad
     Waymobar.Tray
+    Waymobar.Weather
     Waymobar.Widgets
     Waymobar.Wayland.Protocol
     Waymobar.Wayland.Wire

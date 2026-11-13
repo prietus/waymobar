@@ -52,6 +52,7 @@ BuildRequires:  pkgconfig(libpulse)
 # the library (like xmobar).
 Requires:       ghc-%{name}-devel%{?_isa} = %{version}-%{release}
 Recommends:     rivermonad
+Recommends:     curl
 Recommends:     libnotify
 
 %description

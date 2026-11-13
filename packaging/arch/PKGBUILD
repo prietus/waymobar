@@ -11,6 +11,7 @@ license=('BSD-3-Clause')
 # library this package also installs (like xmobar/xmonad).
 depends=('ghc' 'ghc-libs' 'haskell-network' 'cairo' 'pango' 'gdk-pixbuf2' 'libpulse')
 optdepends=('rivermonad: workspaces, layout and window title widgets'
+            'curl: weather widget'
             'ttf-nerd-fonts-symbols: icons'
             'libnotify: notifications when the configuration fails to compile')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
