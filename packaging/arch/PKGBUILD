@@ -15,9 +15,8 @@ optdepends=('rivermonad: workspaces, layout and window title widgets'
             'ttf-nerd-fonts-symbols: icons'
             'ttf-material-symbols-variable: icons (the ones of rivermonad-dotfiles)'
             'libnotify: notifications when the configuration fails to compile')
-# After tagging v$pkgver: updpkgsums (see ../README.md).
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('201d0fe9b91a8523f1d325b7ab6eb0e81680cec166259b4575de785a0e30e301')
 
 build() {
   cd $pkgname-$pkgver
