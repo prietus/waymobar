@@ -114,6 +114,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
 | `weather cfg f` | the current weather, from Open-Meteo (see below) |
+| `withCalendar cfg w`, `calendar cfg f` | the agenda of iCloud, Google, CalDAV and iCal calendars, in a popover under the clock or as a widget (see below) |
 | `text markup` | fixed text |
 | `periodic secs io` | any `IO String` (`readCommand` gives a command's first line) |
 
@@ -131,7 +132,7 @@ strings.
 
 ### Popovers
 
-A block with hover markup (`hoverMarkup`, `weatherHover`, `networkHover`,
+A block with hover markup (`hoverMarkup`, `weatherHover`, `networkHover`, `calendarHover`,
 or `blockHoverMarkup` in your own widgets) opens a popover under it while
 the pointer is on it: a rounded panel with a soft shadow that fades in,
 for the details that don't fit in the bar. The markup may have several
@@ -323,6 +324,56 @@ weather defaultWeather
   Nothing -> ""
   Just w -> weatherIcon w ++ " " ++ show (weatherTemp w) ++ "°"
 ```
+
+### Calendar
+
+`withCalendar cfg w` turns another widget, usually the clock, into a
+calendar: with the pointer on it, a popover lists today's events and the
+next ones. `calendar cfg f` is a widget of its own, with
+`f :: Agenda -> String` for the bar (`""` hides it).
+
+```haskell
+withCalendar defaultCalendar
+  { calendarAccounts =
+      [ ICloud "me@icloud.com" (PasswordFile "~/.config/waymobar/icloud-password")
+      , IcsUrl "https://example.org/holidays.ics"
+      ]
+  }
+  (clock "%a %d %b  %H:%M")
+```
+
+| Account | |
+|---|---|
+| `ICloud user secret` | every calendar of the account, with an [app-specific password](https://support.apple.com/102654) |
+| `Google user secret` | the main calendar of the account, with an [app password](https://support.google.com/accounts/answer/185833); if Google rejects it, use the calendar's "secret address in iCal format" as an `IcsUrl` |
+| `CalDav url user secret` | every calendar of an account on any CalDAV server (Nextcloud, Fastmail, Radicale...) |
+| `IcsUrl url` | a read-only iCal address (`https://` or `webcal://`); no user or password |
+
+The secret is `Password "..."` (in the configuration itself),
+`PasswordFile "~/path"` (the first line of a file; `chmod 600` it) or
+`PasswordCommand "secret-tool lookup service icloud"` (the first line a
+command prints), so a configuration can be shared without its passwords.
+They reach `curl` through its standard input, never on its command line.
+
+`calendarDays` is how far ahead to look (14), `calendarInterval` the
+seconds between updates (600); a left click refreshes
+(`calendarClickRefreshes`). Repeating events are expanded and times are
+shown in the system's time zone.
+
+`calendarMarkup :: Agenda -> String -> String` rewrites the markup of the
+widget wrapped by `withCalendar`, to mark in the bar that there are events:
+
+```haskell
+calendarMarkup = \a s -> if null (agendaToday a) then s else s ++ " <span foreground='#f9e2af'>•</span>"
+```
+
+`calendarHover :: Agenda -> String` is the popover; the default,
+`agendaMarkup`, groups the next ten events under "Today", "Tomorrow" or
+their day, each with a dot in its calendar's colour. An `Agenda` has
+`agendaNow`, `agendaEvents` (the ones that are not over, soonest first;
+`agendaToday` keeps today's), `agendaErrors` (accounts that could not be
+read) and `agendaLoaded`; an `Event` has `eventStart`, `eventEnd`,
+`eventAllDay`, `eventTitle` and `eventColor`.
 
 ### System tray
 

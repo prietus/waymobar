@@ -46,6 +46,7 @@ BuildRequires:  pkgconfig(pangocairo)
 BuildRequires:  pkgconfig(pango)
 BuildRequires:  pkgconfig(cairo)
 BuildRequires:  pkgconfig(gdk-pixbuf-2.0)
+BuildRequires:  pkgconfig(glib-2.0)
 BuildRequires:  pkgconfig(libpulse)
 
 # ~/.config/waymobar/waymobar.hs is compiled at run time with ghc, against
@@ -83,6 +84,7 @@ Requires:       pkgconfig(pangocairo)
 Requires:       pkgconfig(pango)
 Requires:       pkgconfig(cairo)
 Requires:       pkgconfig(gdk-pixbuf-2.0)
+Requires:       pkgconfig(glib-2.0)
 Requires:       pkgconfig(libpulse)
 
 %description -n ghc-%{name}-devel

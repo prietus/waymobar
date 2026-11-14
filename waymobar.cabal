@@ -39,10 +39,12 @@ library
     Waymobar
     Waymobar.Audio
     Waymobar.Bar
+    Waymobar.Calendar
     Waymobar.Config
     Waymobar.Core
     Waymobar.DBus
     Waymobar.Draw
+    Waymobar.Ical
     Waymobar.Icons
     Waymobar.JSON
     Waymobar.Main
@@ -53,10 +55,11 @@ library
     Waymobar.Tray
     Waymobar.Weather
     Waymobar.Widgets
+    Waymobar.XML
     Waymobar.Wayland.Protocol
     Waymobar.Wayland.Wire
-  c-sources:        cbits/waymobar.c, cbits/icons.c, cbits/pulse.c, cbits/net.c, cbits/text.c
-  pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0, libpulse
+  c-sources:        cbits/waymobar.c, cbits/icons.c, cbits/pulse.c, cbits/net.c, cbits/text.c, cbits/tz.c
+  pkgconfig-depends: pangocairo, pango, cairo, gdk-pixbuf-2.0, glib-2.0 >= 2.68, libpulse
   build-depends:
       base        >=4.16 && <5
     , binary      >=0.8  && <0.11

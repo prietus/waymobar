@@ -9,9 +9,9 @@ arch=('x86_64' 'aarch64')
 license=('BSD-3-Clause')
 # ghc: ~/.config/waymobar/waymobar.hs is compiled at run time, against the
 # library this package also installs (like xmobar/xmonad).
-depends=('ghc' 'ghc-libs' 'haskell-network' 'cairo' 'pango' 'gdk-pixbuf2' 'libpulse')
+depends=('ghc' 'ghc-libs' 'haskell-network' 'cairo' 'pango' 'glib2' 'gdk-pixbuf2' 'libpulse')
 optdepends=('rivermonad: workspaces, layout and window title widgets'
-            'curl: weather widget'
+            'curl: weather and calendar widgets'
             'ttf-nerd-fonts-symbols: icons'
             'libnotify: notifications when the configuration fails to compile')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")

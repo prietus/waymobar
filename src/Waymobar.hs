@@ -18,6 +18,7 @@ module Waymobar
   , module Waymobar.Network
   , module Waymobar.Media
   , module Waymobar.Weather
+  , module Waymobar.Calendar
   , R.Action (..)
   , R.Workspace (..)
   , R.RState (..)
@@ -34,6 +35,7 @@ import Waymobar.Audio
 import Waymobar.Network
 import Waymobar.Media
 import Waymobar.Weather
+import Waymobar.Calendar
 
 -- | Run a bar with this configuration on every output.
 waymobar :: Config -> IO ()
