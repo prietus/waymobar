@@ -30,7 +30,7 @@ sudo dnf install rpm-build rpmdevtools dnf-plugins-core
 sudo dnf builddep packaging/fedora/waymobar.spec
 spectool -g -R packaging/fedora/waymobar.spec
 rpmbuild -bb packaging/fedora/waymobar.spec
-sudo dnf install ~/rpmbuild/RPMS/*/{,ghc-}waymobar*-0.1.0-*.rpm
+sudo dnf install ~/rpmbuild/RPMS/*/{,ghc-}waymobar*-0.2.0-*.rpm
 ```
 
 The same spec builds in [COPR](https://copr.fedorainfracloud.org/).

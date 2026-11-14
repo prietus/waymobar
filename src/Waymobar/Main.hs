@@ -25,7 +25,7 @@ launch = do
       if ok then exitSuccess else exitFailure
     ["--default"] -> runBar def
     ["--help"] -> usage >> exitSuccess
-    ["--version"] -> putStrLn "waymobar 0.1.0" >> exitSuccess
+    ["--version"] -> putStrLn "waymobar 0.2.0" >> exitSuccess
     [] -> do
       d <- getDirs
       have <- doesFileExist (cfgSource d)

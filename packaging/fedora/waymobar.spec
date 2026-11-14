@@ -6,7 +6,7 @@
 %{?haskell_setup}
 
 Name:           %{pkg_name}
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Wayland status bar written and configured in Haskell
 
@@ -152,5 +152,8 @@ This package provides the Haskell %{name} profiling library.
 
 
 %changelog
+* Sat Nov 14 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.2.0-1
+- Weather and calendar widgets, popovers for hover markup and menus, Wi-Fi menu
+
 * Mon Nov 09 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.1.0-1
 - First release

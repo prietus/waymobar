@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               waymobar
-version:            0.1.0
+version:            0.2.0
 synopsis:           A Wayland status bar written and configured in Haskell
 description:
   waymobar is a status bar for Wayland compositors with wlr-layer-shell,
