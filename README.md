@@ -164,6 +164,11 @@ Two kinds, both sharp at any output scale:
   symbols (`"\xf028 "`). With the "Symbols Nerd Font" installed (the
   symbols-only package) fontconfig picks the glyphs from it automatically,
   whatever your text font is. They take the text colour.
+  [Material Symbols](https://fonts.google.com/icons) are written by name
+  in a span with that font: `<span font_desc='Material Symbols Rounded 14 @FILL=1' rise='-4620'>wifi</span>`
+  (the `rise` lowers the icon, bigger than the text, to keep both centred).
+  [examples/waymobar.hs](examples/waymobar.hs) has a helper for it that
+  scales the icons with the size of the bar's font.
 * **Images.** SVG, PNG… files or freedesktop theme icons, rasterized when
   the bar is drawn at the output's real pixel size (cached), so an SVG is
   not blurred on HiDPI outputs. SVG needs gdk-pixbuf's loader
