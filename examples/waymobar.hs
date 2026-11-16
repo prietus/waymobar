@@ -6,6 +6,8 @@
 -- The icons are Material Symbols (https://fonts.google.com/icons), from
 -- the variable font (ttf-material-symbols-variable on Arch). Without it
 -- their names show as text: use plain labels instead ("cpu " ++ ...).
+import Control.Monad (when)
+
 import Waymobar
 
 -- | The font of the bar. The icons scale with 'fontSize', so changing it
@@ -23,6 +25,11 @@ main = waymobar def
   , position = Top
   , bgColor = "#1d2021"
   , fgColor = "#ebdbb2"
+    -- menus, popovers and the side panel
+  , popoverBg = Just "#282828"
+  , popoverRadius = 12
+  , menuBorder = "#504945"
+  , menuHighlight = "#3c3836"
   , left =
       [ workspaces defaultWorkspaces
           { hideEmpty = True
@@ -41,7 +48,32 @@ main = waymobar def
         -- 'clock' escapes its text, so the icon is added afterwards
       , colored "#fabd2f" (markup (sym "schedule" ++) (clock "%a %d %b  %H:%M:%S"))
       ]
+    -- push the pointer against the right edge of the screen
+  , sidePanel = Just sessionPanel
   }
+
+-- | Hidden at the right edge: a column of icons to rebuild and restart
+-- waymobar or rivermonad, log out, reboot and power off. With the pointer
+-- on one, a popover beside it says what it does; logging out, rebooting
+-- and powering off ask first.
+sessionPanel :: SidePanel
+sessionPanel = defaultSidePanel
+  { panelRowHeight = 40   -- square buttons
+  , panelWidgets =
+      [ button "toolbar" "Rebuild waymobar" $
+          onClick (\c -> when (clickButton c == LeftButton) restartWaymobar) . text
+      , button "grid_view" "Rebuild rivermonad" $
+          spawnOnClick "rivermonad --recompile && rivermonad --restart" . text
+      , button "logout" "Log out" logoutButton
+      , button "restart_alt" "Reboot" $
+          confirmOnClick "Reboot" (spawn "systemctl reboot") . text
+      , button "power_settings_new" "Power off" $
+          confirmOnClick "Power off" (spawn "systemctl poweroff") . text
+      ]
+  }
+  where
+    -- an icon that says what it does while the pointer is on it
+    button name tip widget = hoverMarkup (const tip) (widget (symbol name))
 
 -- | A Material Symbols icon by its name ("wifi", "volume_up"...), in the
 -- colour of the text around it, followed by a space.
