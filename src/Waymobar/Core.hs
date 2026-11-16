@@ -5,6 +5,10 @@ module Waymobar.Core
   , Position (..)
   , Layer (..)
   , defaultConfig
+    -- * Side panel
+  , SidePanel (..)
+  , Edge (..)
+  , defaultSidePanel
     -- * Widgets
   , Widget (..)
   , BarEnv (..)
@@ -62,7 +66,34 @@ data Config = Config
     -- see-through)
   , popoverRadius :: Double    -- ^ rounded corners of menus and popovers
   , popoverFade   :: Int       -- ^ milliseconds they take to fade in; 0 = no animation
+  , sidePanel     :: Maybe SidePanel
+    -- ^ a hidden panel that slides out when the pointer is pushed against
+    -- an edge of the screen ('Nothing' = none)
   }
+
+-- | A side of the screen.
+data Edge = LeftEdge | RightEdge
+  deriving (Eq, Show)
+
+-- | A panel hidden at a side of the screen: pushing the pointer against
+-- that edge slides it out, and it goes away once the pointer leaves it.
+-- Its widgets are stacked, one row per block, like the entries of a menu
+-- (it looks like the menus and popovers: 'popoverBg', 'popoverRadius',
+-- 'menuBorder', 'menuHighlight'). A block's hover markup shows in a
+-- popover beside it, so a column of icons can say what each one does.
+data SidePanel = SidePanel
+  { panelEdge      :: Edge
+  , panelWidgets   :: [Widget]
+  , panelDelay     :: Int   -- ^ milliseconds the pointer rests at the edge before the panel opens
+  , panelHideDelay :: Int   -- ^ milliseconds after the pointer leaves it before it closes
+  , panelSlide     :: Int   -- ^ milliseconds it takes to slide in; 0 = no animation
+  , panelRowHeight :: Int   -- ^ height of every row in logical pixels; 0 = fit its contents
+  }
+
+-- | The right edge, opening after 150 ms and closing 400 ms after the
+-- pointer leaves; no widgets yet.
+defaultSidePanel :: SidePanel
+defaultSidePanel = SidePanel RightEdge [] 150 400 200 0
 
 -- | An empty bar; "Waymobar.Config" has a populated 'def'.
 defaultConfig :: Config
@@ -89,6 +120,7 @@ defaultConfig = Config
   , popoverBg = Nothing
   , popoverRadius = 10
   , popoverFade = 140
+  , sidePanel = Nothing
   }
 
 -- | An output name, such as @"DP-1"@ (empty if the compositor did not say).

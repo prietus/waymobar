@@ -11,6 +11,8 @@ module Waymobar.Draw
   , strokeRounded
   , fillRoundedReplace
   , withFade
+  , withFadeXY
+  , withTranslate
   , clear
     -- * Text
   , Font
@@ -305,12 +307,25 @@ fillRoundedReplace (Canvas cr) x y w h r = do
 -- | Draw everything in the action as one layer, moved @dy@ down and
 -- blended with opacity @alpha@: one step of a fade (and slide) animation.
 withFade :: Canvas -> Double -> Double -> IO a -> IO a
-withFade (Canvas cr) alpha dy act = do
+withFade cv alpha dy = withFadeXY cv alpha 0 dy
+
+-- | Like 'withFade', moved @dx@ right too.
+withFadeXY :: Canvas -> Double -> Double -> Double -> IO a -> IO a
+withFadeXY (Canvas cr) alpha dx dy act = do
   c_push_group cr
   c_save cr
-  c_translate cr 0 (realToFrac dy)
+  c_translate cr (realToFrac dx) (realToFrac dy)
   r <- act
   c_restore cr
   c_pop_group_to_source cr
   c_paint_with_alpha cr (realToFrac (max 0 (min 1 alpha)))
+  pure r
+
+-- | Draw with the origin moved to @(dx, dy)@.
+withTranslate :: Canvas -> Double -> Double -> IO a -> IO a
+withTranslate (Canvas cr) dx dy act = do
+  c_save cr
+  c_translate cr (realToFrac dx) (realToFrac dy)
+  r <- act
+  c_restore cr
   pure r

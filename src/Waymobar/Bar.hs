@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Wayland side: one layer-shell surface per output, drawn with
--- cairo/pango into shared memory buffers, plus popup menus and the
--- popovers that show hover markup.
+-- cairo/pango into shared memory buffers, plus popup menus, the popovers
+-- that show hover markup and the side panel (a thin strip at an edge of
+-- every output, and the panel it slides out).
 --
 -- Threads: a reader thread decodes compositor events, widgets update
 -- their contents from their own threads; everything ends up in one queue
@@ -21,7 +22,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (find, findIndex)
+import Data.List (find, findIndex, zip4)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Text as T
@@ -54,6 +55,8 @@ data Msg
   | MsgMenu ObjectId (Double, Double) [MenuEntry]  -- ^ bar surface, anchor, entries
   | MsgMenuTimeout Int                              -- ^ close the menu if the pointer is still away
   | MsgTick                                         -- ^ nothing to do but look at the clock (animations)
+  | MsgPanelOpen Int                                -- ^ open the side panel if the pointer still rests at the edge
+  | MsgPanelHide Int                                -- ^ close it if the pointer is still away
 
 data Globals = Globals
   { gCompositor :: Maybe (ObjectId, Word32)  -- ^ object and bound version
@@ -71,6 +74,7 @@ data Out = Out
   , oDone   :: Bool
   , oGlobal :: Word32
   , oBar    :: Maybe ObjectId   -- ^ the bar's wl_surface
+  , oStrip  :: Maybe ObjectId   -- ^ the wl_surface of the side panel's strip
   }
 
 data Buffer = Buffer
@@ -123,6 +127,31 @@ data Tip = Tip
   , tFrame   :: Maybe ObjectId          -- ^ pending frame callback
   }
 
+-- | The invisible strip along an edge of an output that opens the side
+-- panel when the pointer is pushed against it.
+data Strip = Strip
+  { stSurface :: ObjectId
+  , stLayer   :: ObjectId
+  , stOutput  :: ObjectId
+  }
+
+-- | The side panel, while it is out (or sliding in or away).
+data Panel = Panel
+  { plSurface    :: ObjectId
+  , plLayer      :: ObjectId
+  , plOutput     :: ObjectId
+  , plOutputName :: String
+  , plBox        :: (Double, Double)   -- ^ left and right edge of the panel in its surface
+  , plHits       :: [(Double, Double, Click -> IO ())]  -- ^ rows that take clicks (y ranges)
+  , plRows       :: [(Double, Double)] -- ^ rows whose look changes under the pointer
+  , plTips       :: [(Double, Double, String)]  -- ^ rows with hover markup
+  , plHoverY     :: Maybe Double
+  , plFrom       :: Double             -- ^ like a popover's fade: 1 = out, 0 = hidden
+  , plTo         :: Double
+  , plStart      :: Double
+  , plFrame      :: Maybe ObjectId
+  }
+
 -- | A row of an open menu.
 data Row = RowEntry MenuEntry | RowBack
 
@@ -157,6 +186,9 @@ data S = S
   , sBars      :: M.Map ObjectId Bar      -- ^ by wl_surface
   , sPopup     :: Maybe Popup
   , sTip       :: Maybe Tip
+  , sStrips    :: M.Map ObjectId Strip    -- ^ by wl_surface
+  , sPanel     :: Maybe Panel
+  , sPanelGen  :: Int                     -- ^ bumped when the pointer enters or leaves a surface
   , sSeats     :: M.Map ObjectId Seat
   , sLastPress :: Maybe (ObjectId, Word32)  -- ^ seat and serial of the last button press
   , sReady     :: Bool                      -- ^ the initial roundtrip is done
@@ -168,6 +200,7 @@ data Env = Env
   , eCfg     :: Config
   , eHeight  :: Int
   , eWidgets :: ([Output -> IO [Block]], [Output -> IO [Block]], [Output -> IO [Block]])
+  , ePanel   :: [Output -> IO [Block]]  -- ^ the side panel's widgets
   , eState   :: IORef S
   , eSync    :: ObjectId
   , ePush    :: Msg -> IO ()
@@ -189,6 +222,7 @@ runBar cfg = do
   ws <- (,,) <$> mapM (`startWidget` benv) (left cfg)
              <*> mapM (`startWidget` benv) (center cfg)
              <*> mapM (`startWidget` benv) (right cfg)
+  pws <- mapM (`startWidget` benv) (maybe [] panelWidgets (sidePanel cfg))
   h <- if barHeight cfg > 0 then pure (barHeight cfg) else (+ 6) <$> fontHeight (font cfg)
 
   conn <- connect `E.catch` \(e :: E.SomeException) -> do
@@ -202,8 +236,9 @@ runBar cfg = do
   st <- newIORef S
     { sGlobals = Globals Nothing Nothing Nothing Nothing Nothing Nothing Nothing
     , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing
+    , sStrips = M.empty, sPanel = Nothing, sPanelGen = 0
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
-  let env = Env conn reg cfg h ws st sync push
+  let env = Env conn reg cfg h ws pws st sync push
   let loop = do
         first <- atomically (readTQueue q)
         rest <- atomically (flushTQueue q)
@@ -248,7 +283,9 @@ handle env = \case
     hPutStrLn stderr ("waymobar: " ++ why)
     pure True
   MsgRedraw -> do
-    modifyIORef' (eState env) $ \s -> s { sSurfs = M.mapWithKey (\k sf -> if M.member k (sBars s) then sf { sfDirty = True } else sf) (sSurfs s) }
+    modifyIORef' (eState env) $ \s ->
+      let ours k = M.member k (sBars s) || Just k == (plSurface <$> sPanel s)
+      in s { sSurfs = M.mapWithKey (\k sf -> if ours k then sf { sfDirty = True } else sf) (sSurfs s) }
     pure False
   MsgMenu bar area entries -> openMenu env bar area entries [] True >> pure False
   MsgMenuTimeout gen -> do
@@ -259,6 +296,8 @@ handle env = \case
     forM_ (sPopup s) $ \p -> when (pAway p == gen && not onUs) (closeMenu env)
     pure False
   MsgTick -> pure False
+  MsgPanelOpen gen -> panelOpen env gen >> pure False
+  MsgPanelHide gen -> panelHide env gen >> pure False
   MsgEvent ev -> event env ev >> pure False
 
 event :: Env -> Event -> IO ()
@@ -271,6 +310,7 @@ event env ev = case ev of
     outs <- sOutputs <$> readIORef st
     forM_ [ o | (o, out) <- M.toList outs, oGlobal out == name ] $ \o -> do
       destroyBarOn env o
+      destroyPanelOn env o
       modifyIORef' st $ \s -> s { sOutputs = M.delete o (sOutputs s) }
       wlOutputRelease c o
   EvWlCallback cb (WlCallbackDone _) | cb == eSync env -> do
@@ -293,6 +333,10 @@ event env ev = case ev of
     forM_ mt $ \t -> when (tFrame t == Just cb) $ do
       modifyIORef' st $ \s -> s { sTip = Just t { tFrame = Nothing } }
       updSurf (tSurface t) (\sf -> sf { sfDirty = True })
+    mpl <- sPanel <$> readIORef st
+    forM_ mpl $ \pl -> when (plFrame pl == Just cb) $ do
+      modifyIORef' st $ \s -> s { sPanel = Just pl { plFrame = Nothing } }
+      updSurf (plSurface pl) (\sf -> sf { sfDirty = True })
   EvWlOutput o oe -> do
     let upd f = modifyIORef' st $ \s -> s { sOutputs = M.adjust f o (sOutputs s) }
     case oe of
@@ -313,6 +357,22 @@ event env ev = case ev of
           , sfConfigured = True
           , sfDirty = True }
       ZwlrLayerSurfaceV1Closed -> destroyBar env b
+    s <- readIORef st
+    let configure surf lse' = case lse' of
+          ZwlrLayerSurfaceV1Configure serial w h -> do
+            zwlrLayerSurfaceV1AckConfigure c ls serial
+            updSurf surf $ \sf -> sf
+              { sfW = if w == 0 then max 1 (sfW sf) else fromIntegral w
+              , sfH = if h == 0 then max 1 (sfH sf) else fromIntegral h
+              , sfConfigured = True
+              , sfDirty = True }
+          ZwlrLayerSurfaceV1Closed -> pure ()
+    forM_ (find ((== ls) . stLayer) (M.elems (sStrips s))) $ \t -> case lse of
+      ZwlrLayerSurfaceV1Closed -> destroyStrip env t
+      _ -> configure (stSurface t) lse
+    forM_ (sPanel s) $ \pl -> when (plLayer pl == ls) $ case lse of
+      ZwlrLayerSurfaceV1Closed -> closePanel env
+      _ -> configure (plSurface pl) lse
   EvXdgWmBase wm (XdgWmBasePing serial) -> xdgWmBasePong c wm serial
   EvXdgSurface xs (XdgSurfaceConfigure serial) -> do
     mp <- sPopup <$> readIORef st
@@ -356,7 +416,7 @@ global env name iface ver = do
     "xdg_wm_base" -> bind 2 >>= \o -> setG (\g -> g { gWmBase = Just o })
     "wl_output" -> do
       o <- bind 4
-      modifyIORef' st $ \s -> s { sOutputs = M.insert o (Out Nothing 1 False name Nothing) (sOutputs s) }
+      modifyIORef' st $ \s -> s { sOutputs = M.insert o (Out Nothing 1 False name Nothing Nothing) (sOutputs s) }
     "wl_seat" -> do
       o <- bind 7
       modifyIORef' st $ \s -> s { sSeats = M.insert o (Seat Nothing Nothing Nothing 0 0 0) (sSeats s) }
@@ -420,8 +480,12 @@ redrawDirty env = do
       let surf = sfSurface sf
       res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
       forM_ res $ \(hs, hr, ts) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bTips = ts }) surf (sBars s') }
+  -- the strips of the side panel: nothing to see
+  forM_ (M.elems (sStrips s)) $ \t -> forM_ (M.lookup (stSurface t) (sSurfs s)) $ \sf ->
+    when (sfDirty sf && sfConfigured sf) $ void $ present env sf $ \cv -> clear cv (Color 0 0 0 0)
   -- the bars know what is under the pointer now
   syncTip env
+  syncPanel env
   s' <- readIORef (eState env)
   let dirty surf = [ sf | Just sf <- [M.lookup surf (sSurfs s')], sfDirty sf, sfConfigured sf ]
   forM_ (sPopup s') $ \p -> forM_ (dirty (pSurface p)) $ \sf -> do
@@ -445,6 +509,17 @@ redrawDirty env = do
         else pure Nothing
     forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
       x { sTip = (\t' -> t' { tFrame = Just f }) <$> sTip x }
+  forM_ (sPanel s') $ \pl -> forM_ (dirty (plSurface pl)) $ \sf -> do
+    now <- getMonotonicTime
+    let a = panelAlpha (eCfg env) pl now
+    res <- present env sf $ \cv -> do
+      r <- paintPanel env cv pl a (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      f <- if a /= plTo pl && isNothing (plFrame pl)
+        then Just <$> wlSurfaceFrame (eConn env) (sfSurface sf)
+        else pure Nothing
+      pure (r, f)
+    forM_ res $ \((hs, rows, tips), f) -> modifyIORef' (eState env) $ \x ->
+      x { sPanel = (\p' -> p' { plHits = hs, plRows = rows, plTips = tips, plFrame = maybe (plFrame p') Just f }) <$> sPanel x }
 
 -- | Draw a surface into a free buffer and commit it. Nothing if no buffer
 -- was free (it stays dirty and is drawn on release).
@@ -499,8 +574,9 @@ createBars :: Env -> IO ()
 createBars env = do
   s <- readIORef (eState env)
   when (sReady s) $
-    forM_ (M.toList (sOutputs s)) $ \(o, out) ->
-      when (oDone out && isNothing (oBar out) && wanted (oName out)) $ createBar env o out
+    forM_ (M.toList (sOutputs s)) $ \(o, out) -> when (oDone out && wanted (oName out)) $ do
+      when (isNothing (oBar out)) $ createBar env o out
+      forM_ (sidePanel (eCfg env)) $ \sp -> when (isNothing (oStrip out)) $ createStrip env sp o
   where
     wanted n = null (outputs (eCfg env)) || maybe False (`elem` outputs (eCfg env)) n
 
@@ -754,10 +830,15 @@ openMenu env barSurf area entries stack animate = do
   let g = sGlobals s
       cfg = eCfg env
       rows = rowsFor entries stack
-  case (gWmBase g, M.lookup barSurf (sBars s), sLastPress s) of
-    (Just wm, Just bar, Just (seat, serial)) | not (null rows) -> do
+      -- a bar, or the side panel
+      parent = case (M.lookup barSurf (sBars s), sPanel s) of
+        (Just bar, _) -> Just (bLayer bar, bOutput bar, Nothing)
+        (Nothing, Just pl) | plSurface pl == barSurf -> Just (plLayer pl, plOutput pl, Just pl)
+        _ -> Nothing
+  case (gWmBase g, parent, sLastPress s) of
+    (Just wm, Just (parentLayer, parentOutput, mpanel), Just (seat, serial)) | not (null rows) -> do
       (w, h, ys) <- measureMenu cfg rows
-      msf <- newSurf env (bOutput bar)
+      msf <- newSurf env parentOutput
       forM_ msf $ \sf -> do
         let surf = sfSurface sf
             (x0, x1) = area
@@ -774,22 +855,40 @@ openMenu env barSurf area entries stack animate = do
         xs <- xdgWmBaseGetXdgSurface c wm surf
         pos <- xdgWmBaseCreatePositioner c wm
         xdgPositionerSetSize c pos (fromIntegral w) (fromIntegral h)
-        xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
-        -- the panel lines up with the left edge of the block
-        if position cfg == Top
-          then do
-            xdgPositionerSetAnchor c pos xdgPositionerAnchorBottomLeft
-            xdgPositionerSetGravity c pos xdgPositionerGravityBottomRight
-            xdgPositionerSetOffset c pos (negate mg) off
-          else do
-            xdgPositionerSetAnchor c pos xdgPositionerAnchorTopLeft
-            xdgPositionerSetGravity c pos xdgPositionerGravityTopRight
-            xdgPositionerSetOffset c pos (negate mg) (negate off)
-        xdgPositionerSetConstraintAdjustment c pos
-          (xdgPositionerConstraintAdjustmentSlideX .|. xdgPositionerConstraintAdjustmentSlideY .|. xdgPositionerConstraintAdjustmentFlipY)
+        case mpanel of
+          Nothing -> do
+            xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
+            -- the panel lines up with the left edge of the block
+            if position cfg == Top
+              then do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorBottomLeft
+                xdgPositionerSetGravity c pos xdgPositionerGravityBottomRight
+                xdgPositionerSetOffset c pos (negate mg) off
+              else do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorTopLeft
+                xdgPositionerSetGravity c pos xdgPositionerGravityTopRight
+                xdgPositionerSetOffset c pos (negate mg) (negate off)
+            xdgPositionerSetConstraintAdjustment c pos
+              (xdgPositionerConstraintAdjustmentSlideX .|. xdgPositionerConstraintAdjustmentSlideY .|. xdgPositionerConstraintAdjustmentFlipY)
+          Just pl -> do
+            -- beside the side panel, its top in line with the row (the area
+            -- is the row's y range there)
+            let (bx0, bx1) = plBox pl
+            xdgPositionerSetAnchorRect c pos (round bx0) (round x0) (max 1 (round (bx1 - bx0))) (max 1 (round (x1 - x0)))
+            if panelEdgeOf cfg == RightEdge
+              then do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorTopLeft
+                xdgPositionerSetGravity c pos xdgPositionerGravityBottomLeft
+                xdgPositionerSetOffset c pos (mg - round tipGap) (negate (mg + round menuPad + round menuBorderW))
+              else do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorTopRight
+                xdgPositionerSetGravity c pos xdgPositionerGravityBottomRight
+                xdgPositionerSetOffset c pos (round tipGap - mg) (negate (mg + round menuPad + round menuBorderW))
+            xdgPositionerSetConstraintAdjustment c pos
+              (xdgPositionerConstraintAdjustmentSlideY .|. xdgPositionerConstraintAdjustmentFlipX)
         popup <- xdgSurfaceGetPopup c xs nullObject pos
         xdgPositionerDestroy c pos
-        zwlrLayerSurfaceV1GetPopup c (bLayer bar) popup
+        zwlrLayerSurfaceV1GetPopup c parentLayer popup
         xdgPopupGrab c popup seat serial
         wlSurfaceCommit c surf
         now <- getMonotonicTime
@@ -923,10 +1022,16 @@ syncTip env = do
   now <- getMonotonicTime
   let cfg = eCfg env
       -- no popovers while a menu is open
-      want = if isJust (sPopup s) then Nothing else listToMaybe
+      want = if isJust (sPopup s) then Nothing else listToMaybe $
         [ (bSurface b, (x0, x1), m)
         | se <- M.elems (sSeats s), Just f <- [sFocus se], Just b <- [M.lookup f (sBars s)]
-        , (x0, x1, m) <- bTips b, sX se >= x0, sX se < x1 ]
+        , (x0, x1, m) <- bTips b, sX se >= x0, sX se < x1 ] ++
+        -- beside the side panel the area is a row's y range
+        [ (plSurface pl, (y0, y1), m)
+        | Just pl <- [sPanel s], plTo pl == 1
+        , se <- M.elems (sSeats s), sFocus se == Just (plSurface pl)
+        , let (bx0, bx1) = plBox pl, sX se >= bx0, sX se < bx1
+        , (y0, y1, m) <- plTips pl, sY se >= y0, sY se < y1 ]
       set t = modifyIORef' st $ \x -> x
         { sTip = Just t, sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (tSurface t) (sSurfs x) }
       fadeTo t to = t { tFrom = tipAlpha cfg t now, tTo = to, tStart = now }
@@ -959,10 +1064,14 @@ openTip env barSurf area@(x0, x1) m from = do
   s <- readIORef st
   let g = sGlobals s
       cfg = eCfg env
-  case (gWmBase g, gCompositor g, M.lookup barSurf (sBars s)) of
-    (Just wm, Just (comp, _), Just bar) -> do
+      parent = case (M.lookup barSurf (sBars s), sPanel s) of
+        (Just bar, _) -> Just (bLayer bar, bOutput bar, Nothing)
+        (Nothing, Just pl) | plSurface pl == barSurf -> Just (plLayer pl, plOutput pl, Just pl)
+        _ -> Nothing
+  case (gWmBase g, gCompositor g, parent) of
+    (Just wm, Just (comp, _), Just (parentLayer, parentOutput, mpanel)) -> do
       (w, h) <- measureTip cfg m
-      msf <- newSurf env (bOutput bar)
+      msf <- newSurf env parentOutput
       forM_ msf $ \sf -> do
         let surf = sfSurface sf
             barSf = M.lookup barSurf (sSurfs s)
@@ -977,21 +1086,37 @@ openTip env barSurf area@(x0, x1) m from = do
         xs <- xdgWmBaseGetXdgSurface c wm surf
         pos <- xdgWmBaseCreatePositioner c wm
         xdgPositionerSetSize c pos (fromIntegral w) (fromIntegral h)
-        xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
-        -- centred on the block
-        if position cfg == Top
-          then do
-            xdgPositionerSetAnchor c pos xdgPositionerAnchorBottom
-            xdgPositionerSetGravity c pos xdgPositionerGravityBottom
-            xdgPositionerSetOffset c pos 0 (fromIntegral off)
-          else do
-            xdgPositionerSetAnchor c pos xdgPositionerAnchorTop
-            xdgPositionerSetGravity c pos xdgPositionerGravityTop
-            xdgPositionerSetOffset c pos 0 (fromIntegral (negate off))
-        xdgPositionerSetConstraintAdjustment c pos xdgPositionerConstraintAdjustmentSlideX
+        case mpanel of
+          Nothing -> do
+            xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
+            -- centred on the block
+            if position cfg == Top
+              then do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorBottom
+                xdgPositionerSetGravity c pos xdgPositionerGravityBottom
+                xdgPositionerSetOffset c pos 0 (fromIntegral off)
+              else do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorTop
+                xdgPositionerSetGravity c pos xdgPositionerGravityTop
+                xdgPositionerSetOffset c pos 0 (fromIntegral (negate off))
+            xdgPositionerSetConstraintAdjustment c pos xdgPositionerConstraintAdjustmentSlideX
+          Just pl -> do
+            -- beside the panel, centred on the row
+            let (bx0, bx1) = plBox pl
+            xdgPositionerSetAnchorRect c pos (round bx0) (round x0) (max 1 (round (bx1 - bx0))) (max 1 (round (x1 - x0)))
+            if panelEdgeOf cfg == RightEdge
+              then do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorLeft
+                xdgPositionerSetGravity c pos xdgPositionerGravityLeft
+                xdgPositionerSetOffset c pos (fromIntegral (negate off)) 0
+              else do
+                xdgPositionerSetAnchor c pos xdgPositionerAnchorRight
+                xdgPositionerSetGravity c pos xdgPositionerGravityRight
+                xdgPositionerSetOffset c pos (fromIntegral off) 0
+            xdgPositionerSetConstraintAdjustment c pos xdgPositionerConstraintAdjustmentSlideY
         popup <- xdgSurfaceGetPopup c xs nullObject pos
         xdgPositionerDestroy c pos
-        zwlrLayerSurfaceV1GetPopup c (bLayer bar) popup
+        zwlrLayerSurfaceV1GetPopup c parentLayer popup
         wlSurfaceCommit c surf
         now <- getMonotonicTime
         modifyIORef' st $ \s' -> s'
@@ -1018,11 +1143,16 @@ closeTip env = do
 -- away from the bar into its place as it appears.
 paintTip :: Env -> Canvas -> Tip -> Double -> Double -> Double -> IO ()
 paintTip env cv t alpha w h = do
+  s <- readIORef (eState env)
   let cfg = eCfg env
       mg = fromIntegral tipMargin
       dir = if position cfg == Top then -1 else 1
+      -- beside the side panel it comes out of the panel, sideways
+      side = isNothing (M.lookup (tBar t) (sBars s))
+      sideDir = if panelEdgeOf cfg == RightEdge then 1 else -1
+      (dx, dy) = if side then (sideDir * tipSlide * (1 - alpha), 0) else (0, dir * tipSlide * (1 - alpha))
   clear cv (Color 0 0 0 0)
-  withFade cv alpha (dir * tipSlide * (1 - alpha)) $ do
+  withFadeXY cv alpha dx dy $ do
     drawPanel cfg cv mg mg (w - 2 * mg) (h - 2 * mg)
     setColor cv (color (fgColor cfg))
     withFont (font cfg) $ \fnt -> withMarkup cv fnt (tMarkup t) $ \l ->
@@ -1046,6 +1176,284 @@ drawPanel cfg cv px py pw ph = do
   fillRoundedReplace cv px py pw ph r
   setColor cv (color (menuBorder cfg))
   strokeRounded cv px py pw ph r 1
+
+------------------------------------------------------------------------------
+-- The side panel
+
+panelEdgeOf :: Config -> Edge
+panelEdgeOf = maybe RightEdge panelEdge . sidePanel
+
+panelGap, panelPadY, stripW :: Double
+panelGap = 6       -- between the panel and the edge of the screen
+panelPadY = 5      -- above the first row and below the last
+stripW = 1         -- the strip at the edge that opens it
+
+-- | The strip along the edge of an output: transparent, it only takes the
+-- pointer. It keeps out of the bar's exclusive zone.
+createStrip :: Env -> SidePanel -> ObjectId -> IO ()
+createStrip env sp o = do
+  g <- sGlobals <$> readIORef st
+  msf <- newSurf env o
+  forM_ ((,) <$> msf <*> gLayerShell g) $ \(sf, (shell, _)) -> do
+    let surf = sfSurface sf
+        cfg = eCfg env
+        edge = if panelEdge sp == RightEdge then zwlrLayerSurfaceV1AnchorRight else zwlrLayerSurfaceV1AnchorLeft
+    ls <- zwlrLayerShellV1GetLayerSurface c shell surf o (layerOf cfg) (encodeUtf8 (namespace cfg ++ "-edge"))
+    zwlrLayerSurfaceV1SetSize c ls (round stripW) 0
+    zwlrLayerSurfaceV1SetAnchor c ls (edge .|. zwlrLayerSurfaceV1AnchorTop .|. zwlrLayerSurfaceV1AnchorBottom)
+    zwlrLayerSurfaceV1SetExclusiveZone c ls 0
+    wlSurfaceCommit c surf
+    modifyIORef' st $ \s -> s
+      { sSurfs = M.insert surf sf { sfW = round stripW } (sSurfs s)
+      , sStrips = M.insert surf (Strip surf ls o) (sStrips s)
+      , sOutputs = M.adjust (\x -> x { oStrip = Just surf }) o (sOutputs s) }
+  where
+    c = eConn env
+    st = eState env
+
+layerOf :: Config -> Word32
+layerOf cfg = case layer cfg of
+  BackgroundLayer -> zwlrLayerShellV1LayerBackground
+  BottomLayer -> zwlrLayerShellV1LayerBottom
+  TopLayer -> zwlrLayerShellV1LayerTop
+  OverlayLayer -> zwlrLayerShellV1LayerOverlay
+
+destroyStrip :: Env -> Strip -> IO ()
+destroyStrip env t = do
+  zwlrLayerSurfaceV1Destroy (eConn env) (stLayer t)
+  destroySurf env (stSurface t)
+  modifyIORef' (eState env) $ \s -> s
+    { sStrips = M.delete (stSurface t) (sStrips s)
+    , sOutputs = M.adjust (\x -> x { oStrip = Nothing }) (stOutput t) (sOutputs s) }
+
+-- | When an output goes away.
+destroyPanelOn :: Env -> ObjectId -> IO ()
+destroyPanelOn env o = do
+  s <- readIORef (eState env)
+  mapM_ (destroyStrip env) [ t | t <- M.elems (sStrips s), stOutput t == o ]
+  forM_ (sPanel s) $ \pl -> when (plOutput pl == o) (closePanel env)
+
+-- | The pointer entered or left one of our surfaces: open the panel after
+-- a moment at the edge, keep it while the pointer is on it, and close it
+-- a moment after the pointer has left.
+panelPointer :: Env -> IO ()
+panelPointer env = forM_ (sidePanel (eCfg env)) $ \sp -> do
+  s <- readIORef (eState env)
+  let gen = sPanelGen s + 1
+      focused = [ f | se <- M.elems (sSeats s), Just f <- [sFocus se] ]
+      onStrip = any (`M.member` sStrips s) focused
+      onPanel = any (\f -> Just f == (plSurface <$> sPanel s)) focused
+      later ms msg = void $ forkIO $ threadDelay (max 0 ms * 1000) >> ePush env msg
+  writeIORef (eState env) s { sPanelGen = gen }
+  case sPanel s of
+    Just pl
+      | onPanel || onStrip -> when (plTo pl == 0) (panelOpen env gen)
+      | plTo pl == 1 -> later (panelHideDelay sp) (MsgPanelHide gen)
+      | otherwise -> pure ()
+    Nothing
+      | onStrip -> if panelDelay sp <= 0 then panelOpen env gen else later (panelDelay sp) (MsgPanelOpen gen)
+      | otherwise -> pure ()
+
+-- | Open the panel (or bring it back while it slides away) on the output
+-- whose strip the pointer is on, if nothing happened since @gen@.
+panelOpen :: Env -> Int -> IO ()
+panelOpen env gen = do
+  s <- readIORef (eState env)
+  let focused = [ f | se <- M.elems (sSeats s), Just f <- [sFocus se] ]
+      strip = listToMaybe [ t | f <- focused, Just t <- [M.lookup f (sStrips s)] ]
+      onPanel = any (\f -> Just f == (plSurface <$> sPanel s)) focused
+  when (gen == sPanelGen s) $ case (sPanel s, strip) of
+    (Just pl, _) | onPanel || maybe False ((== plOutput pl) . stOutput) strip -> when (plTo pl == 0) $ do
+      now <- getMonotonicTime
+      setPanel env pl { plFrom = panelAlpha (eCfg env) pl now, plTo = 1, plStart = now }
+    (Just _, Just t) -> closePanel env >> openPanel env (stOutput t)
+    (Nothing, Just t) -> openPanel env (stOutput t)
+    _ -> pure ()
+
+-- | Slide the panel away, if the pointer has not come back since @gen@;
+-- not while one of its menus is open.
+panelHide :: Env -> Int -> IO ()
+panelHide env gen = do
+  s <- readIORef (eState env)
+  forM_ (sPanel s) $ \pl -> when (gen == sPanelGen s && plTo pl == 1) $
+    if maybe False ((== plSurface pl) . pBar) (sPopup s)
+      then void $ forkIO $ threadDelay 300000 >> ePush env (MsgPanelHide gen)
+      else do
+        now <- getMonotonicTime
+        let pl' = pl { plFrom = panelAlpha (eCfg env) pl now, plTo = 0, plStart = now }
+        setPanel env pl'
+        -- frame callbacks stop if the surface is hidden: make sure it goes
+        void $ forkIO $ threadDelay (round (panelDuration (eCfg env) pl' * 1000000) + 20000) >> ePush env MsgTick
+
+setPanel :: Env -> Panel -> IO ()
+setPanel env pl = modifyIORef' (eState env) $ \s -> s
+  { sPanel = Just pl, sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (plSurface pl) (sSurfs s) }
+
+-- | Close the panel once it has slid away.
+syncPanel :: Env -> IO ()
+syncPanel env = do
+  s <- readIORef (eState env)
+  now <- getMonotonicTime
+  forM_ (sPanel s) $ \pl ->
+    when (plTo pl == 0 && now - plStart pl >= panelDuration (eCfg env) pl) (closePanel env)
+
+-- | How far out the panel is now (0 hidden, 1 out), eased.
+panelAlpha :: Config -> Panel -> Double -> Double
+panelAlpha cfg pl now = plFrom pl + (plTo pl - plFrom pl) * (1 - (1 - p) ^ (3 :: Int))
+  where
+    d = panelDuration cfg pl
+    p = if d <= 0 then 1 else max 0 (min 1 ((now - plStart pl) / d))
+
+-- | Seconds the slide takes; going away is quicker than coming out.
+panelDuration :: Config -> Panel -> Double
+panelDuration cfg pl = fromIntegral (max 0 (maybe 0 panelSlide (sidePanel cfg))) / 1000 * (if plTo pl == 0 then 0.7 else 1)
+
+-- | The visible blocks of the panel's widgets, one per row.
+panelBlocks :: Env -> Output -> IO [Block]
+panelBlocks env out = concat <$> mapM get (ePanel env)
+  where
+    get f = filter visible <$> f out `E.catch` \(e :: E.SomeException) -> do
+      hPutStrLn stderr ("waymobar: widget failed: " ++ show e)
+      pure []
+    visible b = not (null (blockMarkup b)) || isJust (blockIcon b) || isJust (blockIconSource b)
+
+-- | Inner padding of a row: the block's own, or a menu-like default.
+rowPad :: Block -> Double
+rowPad b = let p = fromIntegral (blockPadding b) + boxPadding (blockStyle b) in if p > 0 then p else 12
+
+rowIconSize :: Env -> Block -> Double
+rowIconSize env b = fromIntegral (if blockIconSize b > 0 then blockIconSize b else max 8 (eHeight env - 8))
+
+-- | Width and height of a row with this block and its laid out markup.
+rowSize :: Env -> Block -> (Int, Int) -> (Double, Double)
+rowSize env b (tw, th) = (w, rowH)
+  where
+    fixed = maybe 0 panelRowHeight (sidePanel (eCfg env))
+    rowH
+      | fixed > 0 = max (fromIntegral fixed) (fromIntegral th)
+      | otherwise = max (fromIntegral (eHeight env)) (fromIntegral th + 12)
+    hasIcon = isJust (blockIcon b) || isJust (blockIconSource b)
+    iconPart
+      | hasIcon = rowIconSize env b + (if null (blockMarkup b) then 0 else 4)
+      | otherwise = 0
+    textW = if null (blockMarkup b) then 0 else fromIntegral tw
+    (_, mh) = boxMargin (blockStyle b)
+    w = max (fromIntegral (blockMinWidth b)) (iconPart + textW + 2 * rowPad b) + 2 * mh
+
+-- | The panel's width and height (without the room for its shadow).
+measurePanel :: Env -> [Block] -> IO (Double, Double)
+measurePanel env blocks =
+  allocaBytes 4 $ \p -> withCanvas p 1 1 1 $ \cv -> withFont (font (eCfg env)) $ \fnt ->
+    withLayouts cv fnt (map blockMarkup blocks) $ \lays -> do
+      sizes <- zipWithM (\b l -> rowSize env b <$> layoutSize l) blocks lays
+      pure ( maximum (0 : map fst sizes) + 2 * (menuBorderW + menuInset)
+           , sum (map snd sizes) + 2 * (menuBorderW + panelPadY) )
+
+-- | Slide the panel out on an output.
+openPanel :: Env -> ObjectId -> IO ()
+openPanel env o = do
+  s <- readIORef st
+  let g = sGlobals s
+      cfg = eCfg env
+      name = maybe "" (fromMaybe "" . oName) (M.lookup o (sOutputs s))
+  blocks <- panelBlocks env name
+  case (gLayerShell g, gCompositor g) of
+    (Just (shell, _), Just (comp, _)) | not (null blocks) -> do
+      (pw, ph) <- measurePanel env blocks
+      msf <- newSurf env o
+      forM_ msf $ \sf -> do
+        let surf = sfSurface sf
+            mg = fromIntegral tipMargin
+            right = panelEdgeOf cfg == RightEdge
+            w = ceiling (pw + mg + panelGap) :: Int
+            h = ceiling (ph + 2 * mg) :: Int
+            px = if right then mg else panelGap
+            -- the scale of the strip is the best guess until the compositor says
+            stripSf = listToMaybe [ x | t <- M.elems (sStrips s), stOutput t == o, Just x <- [M.lookup (stSurface t) (sSurfs s)] ]
+        ls <- zwlrLayerShellV1GetLayerSurface c shell surf o (layerOf cfg) (encodeUtf8 (namespace cfg ++ "-panel"))
+        zwlrLayerSurfaceV1SetSize c ls (fromIntegral w) (fromIntegral h)
+        -- anchored to the edge only: centred along it
+        zwlrLayerSurfaceV1SetAnchor c ls (if right then zwlrLayerSurfaceV1AnchorRight else zwlrLayerSurfaceV1AnchorLeft)
+        zwlrLayerSurfaceV1SetExclusiveZone c ls 0
+        -- the panel takes the pointer, and so does the room between it and
+        -- the edge, so the pointer can still rest there
+        region <- wlCompositorCreateRegion c comp
+        if right
+          then wlRegionAdd c region (round px) (round mg) (fromIntegral w - round px) (round ph)
+          else wlRegionAdd c region 0 (round mg) (round (px + pw)) (round ph)
+        wlSurfaceSetInputRegion c surf region
+        wlRegionDestroy c region
+        wlSurfaceCommit c surf
+        now <- getMonotonicTime
+        modifyIORef' st $ \s' -> s'
+          { sSurfs = M.insert surf sf { sfW = w, sfH = h
+                                      , sfScale120 = maybe 0 sfScale120 stripSf
+                                      , sfBufScale = maybe 0 sfBufScale stripSf } (sSurfs s')
+          , sPanel = Just Panel
+              { plSurface = surf, plLayer = ls, plOutput = o, plOutputName = name
+              , plBox = (px, px + pw), plHits = [], plRows = [], plTips = [], plHoverY = Nothing
+              , plFrom = 0, plTo = 1, plStart = now, plFrame = Nothing } }
+    _ -> pure ()
+  where
+    c = eConn env
+    st = eState env
+
+closePanel :: Env -> IO ()
+closePanel env = do
+  s <- readIORef (eState env)
+  forM_ (sPanel s) $ \pl -> do
+    forM_ (sPopup s) $ \p -> when (pBar p == plSurface pl) (closeMenu env)
+    forM_ (sTip s) $ \t -> when (tBar t == plSurface pl) (closeTip env)
+    zwlrLayerSurfaceV1Destroy (eConn env) (plLayer pl)
+    destroySurf env (plSurface pl)
+    modifyIORef' (eState env) $ \s' -> s' { sPanel = Nothing }
+
+-- | Draw the panel, @alpha@ of the way out: it slides from the edge while
+-- it fades in. Returns the rows that take clicks and those with a hover
+-- look (y ranges, where they are once it is out).
+paintPanel :: Env -> Canvas -> Panel -> Double -> Double -> Double
+           -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], [(Double, Double, String)])
+paintPanel env cv pl alpha _ h = do
+  let cfg = eCfg env
+      mg = fromIntegral tipMargin
+      (px, px1) = plBox pl
+      pw = px1 - px
+      right = panelEdgeOf cfg == RightEdge
+      travel = (pw + panelGap) * (1 - alpha) * (if right then 1 else -1)
+      rx = px + menuBorderW + menuInset
+      rw = pw - 2 * (menuBorderW + menuInset)
+  blocks <- panelBlocks env (plOutputName pl)
+  devScale <- canvasScale cv
+  clear cv (Color 0 0 0 0)
+  withFadeXY cv (min 1 (alpha * 1.4)) travel 0 $ do
+    drawPanel cfg cv px mg pw (h - 2 * mg)
+    withFont (font cfg) $ \fnt -> withLayouts cv fnt (map blockMarkup blocks) $ \lays -> do
+      sizes <- mapM layoutSize lays
+      let heights = [ snd (rowSize env b sz) | (b, sz) <- zip blocks sizes ]
+          ys = scanl (+) (mg + menuBorderW + panelPadY) heights
+      rows <- forM (zip4 blocks lays sizes (zip ys (drop 1 ys))) $ \(b, l, (_, th), (y0, y1)) -> do
+        let clickable = isJust (blockOnClick b)
+            base = blockStyle b
+            -- clickable rows light up like the entries of a menu
+            hov = case styleHover base of
+              Just hs -> Just hs
+              Nothing | clickable -> Just noStyle
+                { styleBg = Just (menuHighlight cfg), styleRadius = Just (max 0 (popoverRadius cfg - menuInset)) }
+              Nothing -> Nothing
+            hovered = maybe False (\y -> y >= y0 && y < y1) (plHoverY pl)
+            st = if hovered then maybe base (`mergeStyle` base) hov else base
+            isz = rowIconSize env b
+        ic <- case blockIconSource b of
+          Nothing -> pure (blockIcon b)
+          Just src -> do
+            let Color r g bl _ = color (fromMaybe (fromMaybe (fgColor cfg) (styleFg st)) (blockIconColor b))
+            maybe (blockIcon b) Just <$> resolveIcon src (max 1 (round (isz * devScale))) (Just (r, g, bl)) (blockIconRecolorAll b)
+        withTranslate cv 0 y0 $
+          drawBlock cfg cv b { blockStyle = st, blockIcon = ic, blockPadding = round (rowPad b) - round (boxPadding st) }
+            l rx rw (y1 - y0) th isz
+        pure ( [ (y0, y1, f) | Just f <- [blockOnClick b] ], [ (y0, y1) | isJust hov ]
+             , [ (y0, y1, m) | Just m <- [blockHoverMarkup b], not (null m) ] )
+      pure (concat [ a | (a, _, _) <- rows ], concat [ b | (_, b, _) <- rows ], concat [ t | (_, _, t) <- rows ])
 
 ------------------------------------------------------------------------------
 -- Pointer
@@ -1080,9 +1488,11 @@ pointer env p pe = do
         forM_ (sShape se) $ \d -> wpCursorShapeDeviceV1SetShape c d serial wpCursorShapeDeviceV1ShapeDefault
         setSeat se { sFocus = if M.member surf (sSurfs s) then Just surf else Nothing, sX = x, sY = y, sAxis = 0 }
         hover (Just surf) x y
+        panelPointer env
       WlPointerLeave _ _ -> do
         setSeat se { sFocus = Nothing, sAxis = 0 }
         hover Nothing 0 0
+        panelPointer env
         s' <- readIORef st
         forM_ (sPopup s') $ \pop -> do
           let gen = pAway pop + 1
@@ -1101,7 +1511,9 @@ pointer env p pe = do
             -- does what it normally does
             closeMenu env
             let (a0, a1) = pArea pop
-                onOpener = sFocus se == Just (pBar pop) && sX se >= a0 && sX se < a1
+                -- along a bar the area is an x range, beside the side panel a y range
+                at = if M.member (pBar pop) (sBars s) then sX se else sY se
+                onOpener = sFocus se == Just (pBar pop) && at >= a0 && at < a1
             unless onOpener $ click se (button btn)
           Nothing -> click se (button btn)
       _ -> pointerRest se setSeat
@@ -1136,13 +1548,28 @@ pointer env p pe = do
         when (hx /= bHoverX b) $ modifyIORef' st $ \s' -> s'
           { sBars = M.adjust (\b' -> b' { bHoverX = hx }) (bSurface b) (sBars s')
           , sSurfs = if changed then M.adjust (\sf -> sf { sfDirty = True }) (bSurface b) (sSurfs s') else sSurfs s' }
+      forM_ (sPanel s) $ \pl -> do
+        let hy = if focus == Just (plSurface pl) && inBox pl x then Just y else Nothing
+            under = \py -> [ r | r@(y0, y1) <- plRows pl, Just p' <- [py], p' >= y0, p' < y1 ]
+        when (hy /= plHoverY pl) $ modifyIORef' st $ \s' -> s'
+          { sPanel = Just pl { plHoverY = hy }
+          , sSurfs = if under hy /= under (plHoverY pl) then M.adjust (\sf -> sf { sfDirty = True }) (plSurface pl) (sSurfs s') else sSurfs s' }
       forM_ (sPopup s) $ \pop -> do
         let h = if focus == Just (pSurface pop) then rowAt pop y else Nothing
         when (h /= pHover pop) $ modifyIORef' st $ \s' -> s'
           { sPopup = Just pop { pHover = h }
           , sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (pSurface pop) (sSurfs s') }
+    inBox pl x = let (x0, x1) = plBox pl in x >= x0 && x < x1
     click se btn = do
       s <- readIORef st
+      forM_ (sPanel s) $ \pl -> when (sFocus se == Just (plSurface pl) && inBox pl (sX se)) $
+        forM_ [ (y0, y1, f) | (y0, y1, f) <- plHits pl, sY se >= y0, sY se < y1 ] $ \(y0, y1, f) ->
+          void $ forkIO $ void $ E.try @E.SomeException $ f Click
+            { clickButton = btn
+            , clickOutput = plOutputName pl
+            , clickArea = plBox pl
+            , clickMenu = ePush env . MsgMenu (plSurface pl) (y0, y1)
+            }
       forM_ (sFocus se >>= \surf -> (,) surf <$> M.lookup surf (sBars s)) $ \(surf, b) ->
         forM_ [ (x0, x1, f) | (x0, x1, f) <- bHits b, sX se >= x0, sX se < x1 ] $ \(x0, x1, f) ->
           void $ forkIO $ void $ E.try @E.SomeException $ f Click

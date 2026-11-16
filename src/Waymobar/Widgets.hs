@@ -21,6 +21,7 @@ module Waymobar.Widgets
   , layoutName
   , windowTitle
   , logoutButton
+  , restartWaymobar
     -- * Icons
   , icon
   , withIcon
@@ -30,6 +31,7 @@ module Waymobar.Widgets
     -- * Combinators
   , onClick
   , spawnOnClick
+  , confirmOnClick
   , withStyle
   , baseStyle
   , groupStyle
@@ -54,10 +56,12 @@ import Data.Time (defaultTimeLocale, formatTime, getZonedTime, getCurrentTime, u
 import System.Directory (listDirectory)
 import System.Exit (ExitCode (..))
 import System.IO (BufferMode (..), hGetLine, hSetBuffering, hSetEncoding, utf8)
+import System.Posix.Process (exitImmediately, getProcessID)
 import System.Process
 
 import Waymobar.Core
 import Waymobar.Draw (escapeMarkup)
+import Waymobar.Recompile (recompile)
 import Waymobar.Rivermonad
 
 ------------------------------------------------------------------------------
@@ -338,6 +342,20 @@ logoutButton label = Widget $ \env -> pure $ \_ -> pure
           , MenuSeparator
           , menuItem "Cancel" (pure ()) ] } ]
 
+-- | Rebuild the configuration and start waymobar again with it. If it does
+-- not build, the error is shown in a notification and this bar goes on.
+--
+-- > onClick (\c -> when (clickButton c == LeftButton) restartWaymobar) (text "Rebuild")
+restartWaymobar :: IO ()
+restartWaymobar = do
+  ok <- recompile True
+  when ok $ do
+    pid <- getProcessID
+    -- the new bar starts once this one is gone, so they never overlap
+    _ <- createProcess (shell ("while kill -0 " ++ show pid ++ " 2>/dev/null; do sleep 0.1; done; exec waymobar"))
+           { new_session = True, close_fds = True }
+    exitImmediately ExitSuccess
+
 ------------------------------------------------------------------------------
 -- Combinators
 
@@ -348,6 +366,14 @@ onClick h = mapBlocks (\b -> b { blockOnClick = Just h })
 -- | Run a shell command on left click.
 spawnOnClick :: String -> Widget -> Widget
 spawnOnClick cmd = onClick (\c -> when (clickButton c == LeftButton) (spawn cmd))
+
+-- | On left click, ask first in a menu under the widget: an entry with the
+-- given label runs the action, another one cancels.
+--
+-- > confirmOnClick "Reboot" (spawn "systemctl reboot") (text "Reboot")
+confirmOnClick :: String -> IO () -> Widget -> Widget
+confirmOnClick label act = onClick $ \c -> when (clickButton c == LeftButton) $ clickMenu c
+  [ menuItem label act, MenuSeparator, menuItem "Cancel" (pure ()) ]
 
 -- | Style every block of a widget; the fields set in the given style win
 -- over the block's own (e.g. a state colour of 'workspaces').

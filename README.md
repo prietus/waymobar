@@ -95,6 +95,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `widgetSpacing`, `edgePadding` | `12`, `4` | pixels |
 | `outputs` | `[]` | only these outputs (`["DP-1"]`); `[]` = all |
 | `namespace` | `"waymobar"` | layer-shell namespace |
+| `sidePanel` | `Nothing` | a panel hidden at an edge of the screen (see below) |
 
 ### Widgets
 
@@ -103,6 +104,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `workspaces cfg` | one clickable block per rivermonad workspace; the wheel cycles them |
 | `layoutName fmt` | layout of the workspace on this output; click = next layout |
 | `logoutButton label` | asks for confirmation, then logs out gracefully: windows are asked to close, and the session ends (back to GDM) once they have; cancelled if one refuses |
+| `confirmOnClick label io w` | on left click, a menu asks before running `io` (`confirmOnClick "Reboot" (spawn "systemctl reboot")`) |
 | `windowTitle n` | focused window's title, cut to `n` characters |
 | `clock fmt` | `formatTime` format, updated on the second |
 | `cpu f`, `memory f` | percentages, `f :: Int -> String` |
@@ -127,7 +129,9 @@ greedyView) and `scrollCycles`.
 Combinators: `colored "#hex"`, `withStyle`, `padded n`, `markup f`,
 `hoverMarkup f` (a popover with other markup while the pointer is on the
 widget, see below), `onClick (\c -> ...)`,
-`spawnOnClick "cmd"`. Text is pango markup; use `escape` for untrusted
+`spawnOnClick "cmd"`. `restartWaymobar` rebuilds the configuration and
+starts waymobar again with it (if it fails to build, a notification shows
+the error and the bar goes on). Text is pango markup; use `escape` for untrusted
 strings.
 
 ### Popovers
@@ -154,6 +158,54 @@ It uses `fgColor` and `menuBorder`, and these fields of the configuration:
 
 The shadow and the fade are drawn by waymobar itself, so they look the
 same in every compositor.
+
+### Side panel
+
+`sidePanel = Just defaultSidePanel { panelWidgets = [...] }` hides a panel
+at an edge of the screen: push the pointer against that edge and it
+slides out; it goes away a moment after the pointer leaves it. Its widgets
+are stacked like the entries of a menu, one row per block, and it looks
+like the menus and popovers (`popoverBg`, `popoverRadius`, `menuBorder`,
+`menuHighlight` for the row under the pointer). Menus opened from it
+(`clickMenu`, `logoutButton`, `confirmOnClick`) open beside it, and so
+does a row's hover markup, in a popover: a column of icons can say what
+each one does.
+
+```haskell
+sidePanel = Just defaultSidePanel
+  { panelWidgets =
+      [ onClick (\c -> when (clickButton c == LeftButton) restartWaymobar) (text "Rebuild waymobar")
+      , spawnOnClick "rivermonad --recompile && rivermonad --restart" (text "Rebuild rivermonad")
+      , logoutButton "Log out"
+      , confirmOnClick "Reboot" (spawn "systemctl reboot") (text "Reboot")
+      ]
+  }
+```
+
+| Field | Default | |
+|---|---|---|
+| `panelEdge` | `RightEdge` | or `LeftEdge` |
+| `panelWidgets` | `[]` | its widgets |
+| `panelDelay` | `150` | milliseconds the pointer rests at the edge before it opens |
+| `panelHideDelay` | `400` | milliseconds after the pointer leaves it before it closes |
+| `panelSlide` | `200` | milliseconds of the slide; 0 = no animation |
+| `panelRowHeight` | `0` | height of every row in logical pixels (e.g. as wide as the icons' rows, for square buttons); 0 = fit its contents |
+
+Only icons, each with what it does beside it:
+
+```haskell
+sidePanel = Just defaultSidePanel
+  { panelRowHeight = 42
+  , panelWidgets =
+      [ hoverMarkup (const "Rebuild waymobar") (onClick (\c -> when (clickButton c == LeftButton) restartWaymobar) (text "\xf0b1"))
+      , hoverMarkup (const "Power off") (confirmOnClick "Power off" (spawn "systemctl poweroff") (text "\xf011"))
+      ]
+  }
+```
+
+The edge takes the pointer through a 1 px transparent strip (layer-shell
+namespace `waymobar-edge`, the panel is `waymobar-panel`); with
+rivermonad's `gapsWithEdge` it covers no window.
 
 ### Icons
 
