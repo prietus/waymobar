@@ -14,6 +14,7 @@
 module Waymobar.GeoClue
   ( Fix (..)
   , geoclueFix
+  , geoclueWatch
   ) where
 
 import Control.Concurrent
@@ -41,12 +42,18 @@ gc = "org.freedesktop.GeoClue2"
 -- best one seen is returned when the time is up); 'Nothing' if GeoClue is
 -- missing, refuses the app, or finds nothing in time.
 geoclueFix :: String -> Double -> IO (Maybe Fix)
-geoclueFix desktopId secs =
-  either (const Nothing) id <$> E.try @E.SomeException
-    (E.bracket connectSystem disconnect (session desktopId secs))
+geoclueFix desktopId secs = geoclueWatch desktopId secs (const (pure ()))
 
-session :: String -> Double -> Bus -> IO (Maybe Fix)
-session desktopId secs bus = do
+-- | 'geoclueFix', calling @onFix@ with the first position at once and again
+-- with every better one as it comes (the quick one from the IP address,
+-- then Wi-Fi...), for a caller that can use a rough position meanwhile.
+geoclueWatch :: String -> Double -> (Fix -> IO ()) -> IO (Maybe Fix)
+geoclueWatch desktopId secs onFix =
+  either (const Nothing) id <$> E.try @E.SomeException
+    (E.bracket connectSystem disconnect (session desktopId secs onFix))
+
+session :: String -> Double -> (Fix -> IO ()) -> Bus -> IO (Maybe Fix)
+session desktopId secs onFix bus = do
   r <- call bus gc "/org/freedesktop/GeoClue2/Manager" (gc ++ ".Manager") "GetClient" []
   case r of
     Right [VObjectPath client] -> do
@@ -77,9 +84,10 @@ session desktopId secs bus = do
               refine best
                 | fixAccuracy best <= goodEnough = pure best
                 | otherwise = next >>= \case
-                    Just f -> refine (if fixAccuracy f < fixAccuracy best then f else best)
+                    Just f | fixAccuracy f < fixAccuracy best -> onFix f >> refine f
+                    Just _ -> refine best
                     Nothing -> pure best
-          fix <- next >>= traverse refine
+          fix <- next >>= traverse (\f -> onFix f >> refine f)
           void $ call bus gc client (gc ++ ".Client") "Stop" []
           pure fix
     _ -> pure Nothing

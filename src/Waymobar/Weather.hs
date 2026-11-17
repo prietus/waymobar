@@ -24,7 +24,7 @@ module Waymobar.Weather
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
 import qualified Control.Exception as E
-import Control.Monad (forever, unless, void, when)
+import Control.Monad (unless, void, when)
 import qualified Data.ByteString as B
 import Data.Char (isAlphaNum)
 import Data.IORef
@@ -37,7 +37,7 @@ import System.IO (hClose)
 import System.Process
 
 import Waymobar.Core
-import Waymobar.GeoClue (Fix (..), geoclueFix)
+import Waymobar.GeoClue (Fix (..), geoclueFix, geoclueWatch)
 import Waymobar.JSON
 
 -- | Where to get the weather for.
@@ -123,23 +123,36 @@ weather cfg fmt = Widget $ \env -> do
         | weatherLocation cfg == GeoClue = maybe p id <$> resolveLocation GeoClue
         | otherwise = pure p
   void $ forkIO $ do
-    place0 <- locate
-    placeRef <- newIORef place0
     fails <- newIORef (0 :: Int)
-    forever $ do
-      place <- relocate =<< readIORef placeRef
-      writeIORef placeRef place
-      r <- weatherFetch cfg (weatherUnits cfg) place
-      secs <- case r of
-        Just w -> do
-          writeIORef fails 0
-          set (Just w)
-          pure (weatherInterval cfg)
-        Nothing -> do
-          n <- atomicModifyIORef' fails (\n -> (n + 1, n + 1))
-          when (n >= 3) (set Nothing)
-          pure 60
-      wait secs
+    -- fetch the weather for a place; how long to wait for the next fetch
+    let fetchAt place = weatherFetch cfg (weatherUnits cfg) place >>= \case
+          Just w -> do
+            writeIORef fails 0
+            set (Just w)
+            pure (weatherInterval cfg)
+          Nothing -> do
+            n <- atomicModifyIORef' fails (\n -> (n + 1, n + 1))
+            when (n >= 3) (set Nothing)
+            pure 60
+        loop place secs = do
+          wait secs
+          place' <- relocate place
+          fetchAt place' >>= loop place'
+        fromLocate = do
+          place <- locate
+          fetchAt place >>= loop place
+    case weatherLocation cfg of
+      -- at start, the weather of the first position GeoClue gives (the
+      -- quick one from the IP address) at once, and again with every
+      -- better one (Wi-Fi comes some seconds later)
+      GeoClue -> do
+        latest <- newIORef Nothing
+        _ <- geoclueWatch "waymobar" 30 $ \f -> do
+          let place = fixPlace f
+          secs <- fetchAt place
+          writeIORef latest (Just (place, secs))
+        readIORef latest >>= maybe fromLocate (uncurry loop)
+      _ -> fromLocate
   let click c = when (weatherClickRefreshes cfg && clickButton c == LeftButton) $
         atomically (writeTVar kick True)
   pure $ \_ -> do
@@ -167,7 +180,10 @@ resolveLocation = \case
       lat <- num "lat" o
       lon <- num "lon" o
       pure (Place (maybe "" id (text' "city" o)) lat lon)
-  GeoClue -> fmap (\f -> Place "" (fixLat f) (fixLon f)) <$> geoclueFix "waymobar" 30
+  GeoClue -> fmap fixPlace <$> geoclueFix "waymobar" 30
+
+fixPlace :: Fix -> Place
+fixPlace f = Place "" (fixLat f) (fixLon f)
 
 -- | Ask Open-Meteo for the current weather at a place.
 fetchWeather :: Units -> Place -> IO (Maybe Weather)
