@@ -363,7 +363,10 @@ it follows a laptop around). GeoClue answers waymobar only while an agent runs
 `/etc/geoclue/geoclue.conf` has a `[waymobar]` section with `allowed=true`
 and `system=true`. `geoclueFix` asks it directly for a `Fix` (latitude,
 longitude, accuracy in metres). `weatherUnits` is `Metric` (°C,
-km/h) or `Imperial` (°F, mph); `weatherInterval` defaults to 900 seconds,
+km/h) or `Imperial` (°F, mph); `weatherFetch` is where the weather comes
+from (`fetchWeather`, Open-Meteo, by default: another service fills a
+`Weather` itself, with `httpJsonWith` to fetch its JSON with a header such as
+a token); `weatherInterval` defaults to 900 seconds,
 and a left click refreshes (`weatherClickRefreshes`). `weatherHover` gives
 the markup of the [popover](#popovers) shown while the pointer is on the
 widget, for the details that don't fit in the bar.

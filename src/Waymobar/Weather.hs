@@ -17,6 +17,8 @@ module Waymobar.Weather
   , Place (..)
   , resolveLocation
   , fetchWeather
+  , httpJson
+  , httpJsonWith
   ) where
 
 import Control.Concurrent (forkIO)
@@ -61,11 +63,15 @@ data WeatherConfig = WeatherConfig
     -- ^ markup of the popover shown while the pointer is on the widget
     -- (@""@ = none; it may have several lines): the place, feels-like,
     -- min/max, humidity, wind...
+  , weatherFetch    :: Units -> Place -> IO (Maybe Weather)
+    -- ^ where the weather comes from: 'fetchWeather' (Open-Meteo) by
+    -- default; another service fills a 'Weather' itself, with the WMO
+    -- code in 'weatherCode' ('httpJsonWith' fetches its JSON)
   }
 
--- | Located from the IP address, metric, every 15 minutes.
+-- | Located from the IP address, metric, every 15 minutes, from Open-Meteo.
 defaultWeather :: WeatherConfig
-defaultWeather = WeatherConfig AutoLocation Metric 900 True (const "")
+defaultWeather = WeatherConfig AutoLocation Metric 900 True (const "") fetchWeather
 
 -- | A resolved location.
 data Place = Place
@@ -123,7 +129,7 @@ weather cfg fmt = Widget $ \env -> do
     forever $ do
       place <- relocate =<< readIORef placeRef
       writeIORef placeRef place
-      r <- fetchWeather (weatherUnits cfg) place
+      r <- weatherFetch cfg (weatherUnits cfg) place
       secs <- case r of
         Just w -> do
           writeIORef fails 0
@@ -277,10 +283,15 @@ weatherDescription w = case weatherCode w of
 -- | GET a URL with curl and parse the JSON; 'Nothing' on any failure
 -- (no curl, offline, HTTP error, bad JSON).
 httpJson :: String -> IO (Maybe JValue)
-httpJson url = do
+httpJson = httpJsonWith []
+
+-- | The same with more arguments for curl, e.g. a header:
+-- @httpJsonWith ["-H", "Authorization: Bearer " ++ token] url@.
+httpJsonWith :: [String] -> String -> IO (Maybe JValue)
+httpJsonWith args url = do
   r <- E.try @E.SomeException $ do
     (_, Just out, _, ph) <- createProcess
-      (proc "curl" ["-sfL", "--max-time", "20", "-A", "waymobar", url])
+      (proc "curl" (["-sfL", "--max-time", "20", "-A", "waymobar"] ++ args ++ [url]))
       { std_out = CreatePipe, std_err = NoStream, std_in = NoStream }
     body <- B.hGetContents out
     hClose out
