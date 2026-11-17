@@ -1,6 +1,7 @@
 -- | The weather, from <https://open-meteo.com Open-Meteo> (free, no API
 -- key). The place can be given as coordinates, as a name (looked up with
--- Open-Meteo's geocoder) or found from the public IP address. Fetched with
+-- Open-Meteo's geocoder), found from the public IP address, or asked to
+-- GeoClue (the system's location service). Fetched with
 -- @curl@, so no TLS library is needed.
 module Waymobar.Weather
   ( Weather (..)
@@ -34,6 +35,7 @@ import System.IO (hClose)
 import System.Process
 
 import Waymobar.Core
+import Waymobar.GeoClue (Fix (..), geoclueFix)
 import Waymobar.JSON
 
 -- | Where to get the weather for.
@@ -41,6 +43,8 @@ data Location
   = Coords Double Double   -- ^ latitude, longitude (@Coords 40.42 (-3.70)@)
   | City String            -- ^ a place name, e.g. @"Madrid"@ or @"Sevilla"@ (Open-Meteo's geocoder)
   | AutoLocation           -- ^ from the public IP address (<https://ip-api.com ip-api.com>)
+  | GeoClue                -- ^ from GeoClue (Wi-Fi, GPS, IP...), asked again on every update,
+                           -- as the app @waymobar@; see "Waymobar.GeoClue" for the permission
   deriving (Eq, Show)
 
 data Units
@@ -107,10 +111,18 @@ weather cfg fmt = Widget $ \env -> do
       locate = resolveLocation (weatherLocation cfg) >>= \case
         Just p -> pure p
         Nothing -> wait 60 >> locate
+      -- GeoClue follows you: ask again before every fetch, keeping the
+      -- last place when it has nothing new
+      relocate p
+        | weatherLocation cfg == GeoClue = maybe p id <$> resolveLocation GeoClue
+        | otherwise = pure p
   void $ forkIO $ do
-    place <- locate
+    place0 <- locate
+    placeRef <- newIORef place0
     fails <- newIORef (0 :: Int)
     forever $ do
+      place <- relocate =<< readIORef placeRef
+      writeIORef placeRef place
       r <- fetchWeather (weatherUnits cfg) place
       secs <- case r of
         Just w -> do
@@ -149,6 +161,7 @@ resolveLocation = \case
       lat <- num "lat" o
       lon <- num "lon" o
       pure (Place (maybe "" id (text' "city" o)) lat lon)
+  GeoClue -> fmap (\f -> Place "" (fixLat f) (fixLon f)) <$> geoclueFix "waymobar" 30
 
 -- | Ask Open-Meteo for the current weather at a place.
 fetchWeather :: Units -> Place -> IO (Maybe Weather)

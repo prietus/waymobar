@@ -18,6 +18,7 @@ module Waymobar
   , module Waymobar.Network
   , module Waymobar.Media
   , module Waymobar.Weather
+  , module Waymobar.GeoClue
   , module Waymobar.Calendar
   , R.Action (..)
   , R.Workspace (..)
@@ -35,6 +36,7 @@ import Waymobar.Audio
 import Waymobar.Network
 import Waymobar.Media
 import Waymobar.Weather
+import Waymobar.GeoClue
 import Waymobar.Calendar
 
 -- | Run a bar with this configuration on every output.

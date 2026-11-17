@@ -44,6 +44,7 @@ library
     Waymobar.Core
     Waymobar.DBus
     Waymobar.Draw
+    Waymobar.GeoClue
     Waymobar.Ical
     Waymobar.Icons
     Waymobar.JSON

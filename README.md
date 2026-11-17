@@ -355,8 +355,14 @@ wifiMenu $ networkHover 3 label (maybe "" networkDetails)
 `weather cfg f` shows the current weather from [Open-Meteo](https://open-meteo.com)
 (free, no API key; fetched with `curl`). Start from `defaultWeather` and
 set `weatherLocation`: `City "Madrid"` (Open-Meteo's geocoder),
-`Coords 40.42 (-3.70)`, or `AutoLocation` (the default: the place of your
-public IP address, through ip-api.com). `weatherUnits` is `Metric` (°C,
+`Coords 40.42 (-3.70)`, `AutoLocation` (the default: the place of your
+public IP address, through ip-api.com), or `GeoClue` (the system's location
+service: Wi-Fi, GPS or IP, whatever it has; asked again on every update, so
+it follows a laptop around). GeoClue answers waymobar only while an agent runs
+(GNOME's, KDE's, or `/usr/lib/geoclue-2.0/demos/agent` elsewhere) or when
+`/etc/geoclue/geoclue.conf` has a `[waymobar]` section with `allowed=true`
+and `system=true`. `geoclueFix` asks it directly for a `Fix` (latitude,
+longitude, accuracy in metres). `weatherUnits` is `Metric` (°C,
 km/h) or `Imperial` (°F, mph); `weatherInterval` defaults to 900 seconds,
 and a left click refreshes (`weatherClickRefreshes`). `weatherHover` gives
 the markup of the [popover](#popovers) shown while the pointer is on the

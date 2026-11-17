@@ -17,6 +17,7 @@ module Waymobar.DBus
   , busName
   , connectSession
   , connectSystem
+  , disconnect
   , call
   , callNoReply
   , emitSignal
@@ -454,10 +455,12 @@ readerLoop bus inbox = go B.empty
           Left _ -> pure ()
         go rest
       _ -> do
-        chunk <- NSB.recv (busSock bus) 65536
-        if B.null chunk
-          then failAll
-          else go (buf <> chunk)
+        r <- E.try @E.SomeException (NSB.recv (busSock bus) 65536)
+        case r of
+          Right chunk | not (B.null chunk) -> go (buf <> chunk)
+          -- closed by the bus, or by 'disconnect': fail the pending calls
+          -- and release the socket
+          _ -> failAll >> E.handle (\(_ :: E.SomeException) -> pure ()) (NS.close (busSock bus))
     dispatch msg = case (msgType msg, msgReplySerial msg) of
       (t, Just rs) | t == MethodReturn || t == ErrorMsg -> do
         mv <- modifyMVar (busPending bus) (\m -> pure (M.delete rs m, M.lookup rs m))
@@ -472,6 +475,12 @@ send bus m = withMVar (busWrite bus) $ \_ -> do
   serial <- atomicModifyIORef' (busSerial bus) (\s -> (s + 1, s))
   NSB.sendAll (busSock bus) (renderMessage m { msgSerial = serial })
   pure serial
+
+-- | Close the connection: the calls still waiting fail, and the socket is
+-- released once the reader has seen the end.
+disconnect :: Bus -> IO ()
+disconnect bus = E.handle (\(_ :: E.SomeException) -> pure ()) $
+  NS.shutdown (busSock bus) NS.ShutdownBoth
 
 -- | Call a method and wait (at most 5 seconds) for the reply.
 call :: Bus -> String -> String -> String -> String -> [Value] -> IO (Either String [Value])
