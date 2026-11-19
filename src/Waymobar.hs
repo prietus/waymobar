@@ -20,6 +20,7 @@ module Waymobar
   , module Waymobar.Weather
   , module Waymobar.GeoClue
   , module Waymobar.Calendar
+  , module Waymobar.Apps
   , R.Action (..)
   , R.Workspace (..)
   , R.RState (..)
@@ -38,6 +39,7 @@ import Waymobar.Media
 import Waymobar.Weather
 import Waymobar.GeoClue
 import Waymobar.Calendar
+import Waymobar.Apps
 
 -- | Run a bar with this configuration on every output.
 waymobar :: Config -> IO ()

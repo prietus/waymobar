@@ -54,6 +54,8 @@ data Msg
   | MsgClosed String
   | MsgMenu ObjectId (Double, Double) [MenuEntry]  -- ^ bar surface, anchor, entries
   | MsgMenuTimeout Int                              -- ^ close the menu if the pointer is still away
+  | MsgGrid ObjectId (Double, Double) IconGrid       -- ^ bar surface, anchor, the grid
+  | MsgGridTimeout Int                              -- ^ close the grid if the pointer is still away
   | MsgTick                                         -- ^ nothing to do but look at the clock (animations)
   | MsgPanelOpen Int                                -- ^ open the side panel if the pointer still rests at the edge
   | MsgPanelHide Int                                -- ^ close it if the pointer is still away
@@ -152,6 +154,23 @@ data Panel = Panel
   , plFrame      :: Maybe ObjectId
   }
 
+-- | An open grid of icons.
+data GridPop = GridPop
+  { gpSurface :: ObjectId
+  , gpXdgSurf :: ObjectId
+  , gpPopup   :: ObjectId
+  , gpBar     :: ObjectId               -- ^ parent bar surface
+  , gpArea    :: (Double, Double)       -- ^ the block it opened from
+  , gpGrid    :: IconGrid
+  , gpCell    :: (Double, Double)       -- ^ size of a cell
+  , gpScroll  :: Int                    -- ^ first row shown
+  , gpHover   :: Maybe Int              -- ^ entry under the pointer
+  , gpAway    :: Int                    -- ^ bumped whenever the pointer leaves our surfaces
+  , gpStart   :: Double                 -- ^ when its fade-in started
+  , gpFrame   :: Maybe ObjectId
+  , gpAxis    :: Double                 -- ^ accumulated scroll
+  }
+
 -- | A row of an open menu.
 data Row = RowEntry MenuEntry | RowBack
 
@@ -186,6 +205,7 @@ data S = S
   , sBars      :: M.Map ObjectId Bar      -- ^ by wl_surface
   , sPopup     :: Maybe Popup
   , sTip       :: Maybe Tip
+  , sGrid      :: Maybe GridPop
   , sStrips    :: M.Map ObjectId Strip    -- ^ by wl_surface
   , sPanel     :: Maybe Panel
   , sPanelGen  :: Int                     -- ^ bumped when the pointer enters or leaves a surface
@@ -235,7 +255,7 @@ runBar cfg = do
 
   st <- newIORef S
     { sGlobals = Globals Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-    , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing
+    , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing, sGrid = Nothing
     , sStrips = M.empty, sPanel = Nothing, sPanelGen = 0
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
   let env = Env conn reg cfg h ws pws st sync push
@@ -287,7 +307,13 @@ handle env = \case
       let ours k = M.member k (sBars s) || Just k == (plSurface <$> sPanel s)
       in s { sSurfs = M.mapWithKey (\k sf -> if ours k then sf { sfDirty = True } else sf) (sSurfs s) }
     pure False
-  MsgMenu bar area entries -> openMenu env bar area entries [] True >> pure False
+  MsgMenu bar area entries -> closeGrid env >> openMenu env bar area entries [] True >> pure False
+  MsgGrid bar area g -> openGrid env bar area g >> pure False
+  MsgGridTimeout gen -> do
+    s <- readIORef (eState env)
+    let onUs = any (isJust . sFocus) (M.elems (sSeats s))
+    forM_ (sGrid s) $ \gp -> when (gpAway gp == gen && not onUs) (closeGrid env)
+    pure False
   MsgMenuTimeout gen -> do
     -- river does not dismiss popups on outside clicks: close the menu once
     -- the pointer has been away from it (and from the bar) for a while
@@ -333,6 +359,10 @@ event env ev = case ev of
     forM_ mt $ \t -> when (tFrame t == Just cb) $ do
       modifyIORef' st $ \s -> s { sTip = Just t { tFrame = Nothing } }
       updSurf (tSurface t) (\sf -> sf { sfDirty = True })
+    mgp <- sGrid <$> readIORef st
+    forM_ mgp $ \gp -> when (gpFrame gp == Just cb) $ do
+      modifyIORef' st $ \s -> s { sGrid = Just gp { gpFrame = Nothing } }
+      updSurf (gpSurface gp) (\sf -> sf { sfDirty = True })
     mpl <- sPanel <$> readIORef st
     forM_ mpl $ \pl -> when (plFrame pl == Just cb) $ do
       modifyIORef' st $ \s -> s { sPanel = Just pl { plFrame = Nothing } }
@@ -383,11 +413,17 @@ event env ev = case ev of
     forM_ mt $ \t -> when (tXdgSurf t == xs) $ do
       xdgSurfaceAckConfigure c xs serial
       updSurf (tSurface t) (\sf -> sf { sfConfigured = True, sfDirty = True })
+    mgp <- sGrid <$> readIORef st
+    forM_ mgp $ \gp -> when (gpXdgSurf gp == xs) $ do
+      xdgSurfaceAckConfigure c xs serial
+      updSurf (gpSurface gp) (\sf -> sf { sfConfigured = True, sfDirty = True })
   EvXdgPopup xp XdgPopupPopupDone -> do
     mp <- sPopup <$> readIORef st
     forM_ mp $ \p -> when (pPopup p == xp) (closeMenu env)
     mt <- sTip <$> readIORef st
     forM_ mt $ \t -> when (tPopup t == xp) (closeTip env)
+    mgp <- sGrid <$> readIORef st
+    forM_ mgp $ \gp -> when (gpPopup gp == xp) (closeGrid env)
   EvWpFractionalScaleV1 fs (WpFractionalScaleV1PreferredScale sc) ->
     modifyIORef' st $ \s -> s { sSurfs = M.map (\sf -> if sfFrac sf == Just fs then sf { sfScale120 = fromIntegral sc, sfDirty = True } else sf) (sSurfs s) }
   EvWlSurface surf (WlSurfacePreferredBufferScale sc) ->
@@ -509,6 +545,16 @@ redrawDirty env = do
         else pure Nothing
     forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
       x { sTip = (\t' -> t' { tFrame = Just f }) <$> sTip x }
+  forM_ (sGrid s') $ \gp -> forM_ (dirty (gpSurface gp)) $ \sf -> do
+    now <- getMonotonicTime
+    let a = gridAlpha (eCfg env) gp now
+    cb <- present env sf $ \cv -> do
+      paintGrid env cv gp a (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      if a < 1 && isNothing (gpFrame gp)
+        then Just <$> wlSurfaceFrame (eConn env) (sfSurface sf)
+        else pure Nothing
+    forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
+      x { sGrid = (\g' -> g' { gpFrame = Just f }) <$> sGrid x }
   forM_ (sPanel s') $ \pl -> forM_ (dirty (plSurface pl)) $ \sf -> do
     now <- getMonotonicTime
     let a = panelAlpha (eCfg env) pl now
@@ -621,6 +667,8 @@ destroyBar env b = do
   forM_ mp $ \p -> when (pBar p == bSurface b) (closeMenu env)
   mt <- sTip <$> readIORef (eState env)
   forM_ mt $ \t -> when (tBar t == bSurface b) (closeTip env)
+  mgp <- sGrid <$> readIORef (eState env)
+  forM_ mgp $ \gp -> when (gpBar gp == bSurface b) (closeGrid env)
   zwlrLayerSurfaceV1Destroy (eConn env) (bLayer b)
   destroySurf env (bSurface b)
   modifyIORef' (eState env) $ \s -> s
@@ -1022,7 +1070,7 @@ syncTip env = do
   now <- getMonotonicTime
   let cfg = eCfg env
       -- no popovers while a menu is open
-      want = if isJust (sPopup s) then Nothing else listToMaybe $
+      want = if isJust (sPopup s) || isJust (sGrid s) then Nothing else listToMaybe $
         [ (bSurface b, (x0, x1), m)
         | se <- M.elems (sSeats s), Just f <- [sFocus se], Just b <- [M.lookup f (sBars s)]
         , (x0, x1, m) <- bTips b, sX se >= x0, sX se < x1 ] ++
@@ -1176,6 +1224,183 @@ drawPanel cfg cv px py pw ph = do
   fillRoundedReplace cv px py pw ph r
   setColor cv (color (menuBorder cfg))
   strokeRounded cv px py pw ph r 1
+
+------------------------------------------------------------------------------
+-- Icon grids (application launchers)
+
+gridPad, gridCellPad, gridGap :: Double
+gridPad = 10       -- between the panel's edge and the cells
+gridCellPad = 8    -- inside a cell, around the icon and the label
+gridGap = 6        -- between the icon and its label
+
+-- | The size of a cell and of the panel's surface (shadow included).
+gridGeometry :: Config -> IconGrid -> IO ((Double, Double), (Int, Int))
+gridGeometry cfg g = do
+  lineH <- allocaBytes 4 $ \p -> withCanvas p 1 1 1 $ \cv -> withFont (font cfg) $ \fnt ->
+    withMarkup cv fnt "Ág" $ \l -> snd <$> layoutSize l
+  let isz = fromIntegral (max 16 (gridIconSize g))
+      cols = max 1 (gridColumns g)
+      rows = gridVisibleRows g
+      cw = max 112 (isz + 64)
+      ch = isz + 2 * gridCellPad + gridGap + 2 * fromIntegral lineH
+      mg = fromIntegral tipMargin
+      w = 2 * mg + 2 * gridPad + fromIntegral cols * cw
+      h = 2 * mg + 2 * gridPad + fromIntegral rows * ch
+  pure ((cw, ch), (ceiling w, ceiling h))
+
+gridTotalRows :: IconGrid -> Int
+gridTotalRows g = (length (gridEntries g) + max 1 (gridColumns g) - 1) `div` max 1 (gridColumns g)
+
+gridVisibleRows :: IconGrid -> Int
+gridVisibleRows g = max 1 (min (max 1 (gridRows g)) (gridTotalRows g))
+
+-- | The entry under a point of the grid's surface.
+gridIndexAt :: GridPop -> Double -> Double -> Maybe Int
+gridIndexAt gp x y = do
+  let (cw, ch) = gpCell gp
+      g = gpGrid gp
+      mg = fromIntegral tipMargin
+      cols = max 1 (gridColumns g)
+      cx = (x - mg - gridPad) / cw
+      cy = (y - mg - gridPad) / ch
+  guard (cx >= 0 && cy >= 0 && floor cx < cols && floor cy < gridVisibleRows g)
+  let i = (floor cy + gpScroll gp) * cols + floor cx
+  guard (i < length (gridEntries g))
+  pure i
+
+openGrid :: Env -> ObjectId -> (Double, Double) -> IconGrid -> IO ()
+openGrid env barSurf area g = do
+  closeMenu env
+  closeTip env
+  closeGrid env
+  s <- readIORef st
+  let gl = sGlobals s
+      cfg = eCfg env
+  case (gWmBase gl, gCompositor gl, M.lookup barSurf (sBars s), sLastPress s) of
+    (Just wm, Just (comp, _), Just bar, Just (seat, serial)) | not (null (gridEntries g)) -> do
+      (cell, (w, h)) <- gridGeometry cfg g
+      msf <- newSurf env (bOutput bar)
+      forM_ msf $ \sf -> do
+        let surf = sfSurface sf
+            (x0, x1) = area
+            barSf = M.lookup barSurf (sSurfs s)
+            barH = maybe (eHeight env) sfH barSf
+            mg = fromIntegral tipMargin
+            off = round tipGap - mg
+        region <- wlCompositorCreateRegion c comp
+        wlRegionAdd c region mg mg (fromIntegral w - 2 * mg) (fromIntegral h - 2 * mg)
+        wlSurfaceSetInputRegion c surf region
+        wlRegionDestroy c region
+        xs <- xdgWmBaseGetXdgSurface c wm surf
+        pos <- xdgWmBaseCreatePositioner c wm
+        xdgPositionerSetSize c pos (fromIntegral w) (fromIntegral h)
+        xdgPositionerSetAnchorRect c pos (round x0) 0 (max 1 (round (x1 - x0))) (fromIntegral barH)
+        -- like a menu: its left edge in line with the block's
+        if position cfg == Top
+          then do
+            xdgPositionerSetAnchor c pos xdgPositionerAnchorBottomLeft
+            xdgPositionerSetGravity c pos xdgPositionerGravityBottomRight
+            xdgPositionerSetOffset c pos (negate mg) off
+          else do
+            xdgPositionerSetAnchor c pos xdgPositionerAnchorTopLeft
+            xdgPositionerSetGravity c pos xdgPositionerGravityTopRight
+            xdgPositionerSetOffset c pos (negate mg) (negate off)
+        xdgPositionerSetConstraintAdjustment c pos
+          (xdgPositionerConstraintAdjustmentSlideX .|. xdgPositionerConstraintAdjustmentSlideY .|. xdgPositionerConstraintAdjustmentFlipY)
+        popup <- xdgSurfaceGetPopup c xs nullObject pos
+        xdgPositionerDestroy c pos
+        zwlrLayerSurfaceV1GetPopup c (bLayer bar) popup
+        xdgPopupGrab c popup seat serial
+        wlSurfaceCommit c surf
+        now <- getMonotonicTime
+        modifyIORef' st $ \s' -> s'
+          { sSurfs = M.insert surf sf { sfW = w, sfH = h
+                                      , sfScale120 = maybe 0 sfScale120 barSf
+                                      , sfBufScale = maybe 0 sfBufScale barSf } (sSurfs s')
+          , sGrid = Just GridPop
+              { gpSurface = surf, gpXdgSurf = xs, gpPopup = popup, gpBar = barSurf, gpArea = area
+              , gpGrid = g, gpCell = cell, gpScroll = 0, gpHover = Nothing, gpAway = 0
+              , gpStart = now, gpFrame = Nothing, gpAxis = 0 } }
+    _ -> pure ()
+  where
+    c = eConn env
+    st = eState env
+
+closeGrid :: Env -> IO ()
+closeGrid env = do
+  mg <- sGrid <$> readIORef (eState env)
+  forM_ mg $ \gp -> do
+    xdgPopupDestroy (eConn env) (gpPopup gp)
+    xdgSurfaceDestroy (eConn env) (gpXdgSurf gp)
+    destroySurf env (gpSurface gp)
+    modifyIORef' (eState env) $ \s -> s { sGrid = Nothing }
+
+-- | The opacity of a grid now (it fades in like a menu).
+gridAlpha :: Config -> GridPop -> Double -> Double
+gridAlpha cfg gp now
+  | d <= 0 = 1
+  | otherwise = 1 - (1 - max 0 (min 1 ((now - gpStart gp) / d))) ^ (3 :: Int)
+  where d = fromIntegral (max 0 (popoverFade cfg)) / 1000 :: Double
+
+paintGrid :: Env -> Canvas -> GridPop -> Double -> Double -> Double -> IO ()
+paintGrid env cv gp alpha w h = do
+  let cfg = eCfg env
+      g = gpGrid gp
+      mg = fromIntegral tipMargin
+      (cw, ch) = gpCell gp
+      cols = max 1 (gridColumns g)
+      rows = gridVisibleRows g
+      isz = fromIntegral (max 16 (gridIconSize g))
+      dir = if position cfg == Top then -1 else 1
+      shown = take (rows * cols) (drop (gpScroll gp * cols) (zip [0 ..] (gridEntries g)))
+  devScale <- canvasScale cv
+  clear cv (Color 0 0 0 0)
+  withFade cv alpha (dir * tipSlide * (1 - alpha)) $ do
+    drawPanel cfg cv mg mg (w - 2 * mg) (h - 2 * mg)
+    withFont (font cfg) $ \fnt -> forM_ (zip [0 :: Int ..] shown) $ \(k, (i, e)) -> do
+      let x = mg + gridPad + fromIntegral (k `mod` cols) * cw
+          y = mg + gridPad + fromIntegral (k `div` cols) * ch
+      when (gpHover gp == Just i) $ do
+        setColor cv (color (menuHighlight cfg))
+        fillRounded cv (x + 2) (y + 2) (cw - 4) (ch - 4) (max 0 (popoverRadius cfg - menuInset))
+      icon <- case gridIcon e of
+        Nothing -> pure Nothing
+        Just src -> resolveIcon src (max 1 (round (isz * devScale))) Nothing False
+      let ix = x + (cw - isz) / 2
+          iy = y + gridCellPad
+      case icon of
+        Just ic -> drawIcon cv ic ix iy isz
+        Nothing -> do
+          -- no icon: a rounded square with the first letter
+          setColor cv (color (menuBorder cfg))
+          fillRounded cv ix iy isz isz (isz / 4)
+          setColor cv (color (fgColor cfg))
+          withMarkup cv fnt ("<span size='x-large'><b>" ++ escapeMarkup (take 1 (gridLabel e)) ++ "</b></span>") $ \l -> do
+            (tw, th) <- layoutSize l
+            showLayout cv l (ix + (isz - fromIntegral tw) / 2) (iy + (isz - fromIntegral th) / 2)
+      setColor cv (color (fgColor cfg))
+      withMarkupBox cv fnt (cw - 2 * gridCellPad) 2 (escapeMarkup (gridLabel e)) $ \l ->
+        showLayout cv l (x + gridCellPad) (iy + isz + gridGap)
+    -- where the shown rows are among all of them
+    let total = gridTotalRows g
+    when (total > rows) $ do
+      let trackH = h - 2 * mg - 2 * gridPad
+          barH = max 24 (trackH * fromIntegral rows / fromIntegral total)
+          top = mg + gridPad + (trackH - barH) * fromIntegral (gpScroll gp) / fromIntegral (total - rows)
+          Color r gr b _ = color (fgColor cfg)
+      setColor cv (Color r gr b 0.3)
+      fillRounded cv (w - mg - gridPad / 2 - 2) top 3 barH 1.5
+
+-- | Scroll a grid by some rows (negative: up).
+scrollGrid :: Env -> Int -> IO ()
+scrollGrid env n = do
+  s <- readIORef (eState env)
+  forM_ (sGrid s) $ \gp -> do
+    let g = gpGrid gp
+        top = max 0 (min (gridTotalRows g - gridVisibleRows g) (gpScroll gp + n))
+    when (top /= gpScroll gp) $ modifyIORef' (eState env) $ \x -> x
+      { sGrid = Just gp { gpScroll = top, gpHover = Nothing }
+      , sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (gpSurface gp) (sSurfs x) }
 
 ------------------------------------------------------------------------------
 -- The side panel
@@ -1498,25 +1723,41 @@ pointer env p pe = do
           let gen = pAway pop + 1
           modifyIORef' st $ \x -> x { sPopup = Just pop { pAway = gen } }
           void $ forkIO $ threadDelay 700000 >> ePush env (MsgMenuTimeout gen)
+        forM_ (sGrid s') $ \gp -> do
+          let gen = gpAway gp + 1
+          modifyIORef' st $ \x -> x { sGrid = Just gp { gpAway = gen } }
+          void $ forkIO $ threadDelay 700000 >> ePush env (MsgGridTimeout gen)
       WlPointerMotion _ x y -> do
         setSeat se { sX = x, sY = y }
         hover (sFocus se) x y
       WlPointerButton serial _ btn state | state == wlPointerButtonStatePressed -> do
         modifyIORef' st $ \s' -> s' { sLastPress = Just (seat, serial) }
-        case sPopup s of
-          Just pop | sFocus se == Just (pSurface pop) ->
-            forM_ (rowAt pop (sY se)) (activateRow env pop)
-          Just pop -> do
-            -- a click on the bar closes the menu; on another block it also
-            -- does what it normally does
-            closeMenu env
-            let (a0, a1) = pArea pop
-                -- along a bar the area is an x range, beside the side panel a y range
-                at = if M.member (pBar pop) (sBars s) then sX se else sY se
-                onOpener = sFocus se == Just (pBar pop) && at >= a0 && at < a1
+        case (sGrid s, sPopup s) of
+          (Just gp, _) | sFocus se == Just (gpSurface gp) ->
+            forM_ (gridIndexAt gp (sX se) (sY se) >>= \i -> listToMaybe (drop i (gridEntries (gpGrid gp)))) $ \e -> do
+              closeGrid env
+              void $ forkIO $ void $ E.try @E.SomeException (gridAction e)
+          (Just gp, _) -> do
+            -- a click elsewhere closes it; on the block it opened from that
+            -- is all (so the block toggles it)
+            closeGrid env
+            let (a0, a1) = gpArea gp
+                onOpener = sFocus se == Just (gpBar gp) && sX se >= a0 && sX se < a1
             unless onOpener $ click se (button btn)
-          Nothing -> click se (button btn)
-      _ -> pointerRest se setSeat
+          (Nothing, mpop) -> case mpop of
+            Just pop | sFocus se == Just (pSurface pop) ->
+              forM_ (rowAt pop (sY se)) (activateRow env pop)
+            Just pop -> do
+              -- a click on the bar closes the menu; on another block it also
+              -- does what it normally does
+              closeMenu env
+              let (a0, a1) = pArea pop
+                  -- along a bar the area is an x range, beside the side panel a y range
+                  at = if M.member (pBar pop) (sBars s) then sX se else sY se
+                  onOpener = sFocus se == Just (pBar pop) && at >= a0 && at < a1
+              unless onOpener $ click se (button btn)
+            Nothing -> click se (button btn)
+      _ -> pointerRest s se setSeat
   where
     button :: Word32 -> Button
     button = \case
@@ -1524,7 +1765,13 @@ pointer env p pe = do
       0x111 -> RightButton
       0x112 -> MiddleButton
       n -> OtherButton (fromIntegral n)
-    pointerRest se setSeat = case pe of
+    pointerRest s0 se setSeat = case pe of
+      WlPointerAxis _ axis v | axis == wlPointerAxisVerticalScroll, Just gp <- onGrid s0 se -> do
+        -- one row per notch of the wheel (about 10 units)
+        let acc = gpAxis gp + v
+            n = truncate (acc / 10) :: Int
+        modifyIORef' st $ \x -> x { sGrid = Just gp { gpAxis = acc - fromIntegral n * 10 } }
+        when (n /= 0) (scrollGrid env n)
       WlPointerAxis _ axis v | axis == wlPointerAxisVerticalScroll -> do
         let acc = sAxis se + v
         if abs acc >= 10
@@ -1534,6 +1781,10 @@ pointer env p pe = do
           else setSeat se { sAxis = acc }
       WlPointerAxisStop _ axis | axis == wlPointerAxisVerticalScroll -> setSeat se { sAxis = 0 }
       _ -> pure ()
+    onGrid s0 se = do
+      gp <- sGrid s0
+      guard (sFocus se == Just (gpSurface gp))
+      pure gp
     c = eConn env
     st = eState env
     rowAt pop y = findIndex (\(y0, y1) -> y >= y0 && y < y1) (pLayout pop)
@@ -1554,6 +1805,11 @@ pointer env p pe = do
         when (hy /= plHoverY pl) $ modifyIORef' st $ \s' -> s'
           { sPanel = Just pl { plHoverY = hy }
           , sSurfs = if under hy /= under (plHoverY pl) then M.adjust (\sf -> sf { sfDirty = True }) (plSurface pl) (sSurfs s') else sSurfs s' }
+      forM_ (sGrid s) $ \gp -> do
+        let h = if focus == Just (gpSurface gp) then gridIndexAt gp x y else Nothing
+        when (h /= gpHover gp) $ modifyIORef' st $ \s' -> s'
+          { sGrid = Just gp { gpHover = h }
+          , sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (gpSurface gp) (sSurfs s') }
       forM_ (sPopup s) $ \pop -> do
         let h = if focus == Just (pSurface pop) then rowAt pop y else Nothing
         when (h /= pHover pop) $ modifyIORef' st $ \s' -> s'
@@ -1569,6 +1825,7 @@ pointer env p pe = do
             , clickOutput = plOutputName pl
             , clickArea = plBox pl
             , clickMenu = ePush env . MsgMenu (plSurface pl) (y0, y1)
+            , clickGrid = const (pure ())   -- grids open under a bar
             }
       forM_ (sFocus se >>= \surf -> (,) surf <$> M.lookup surf (sBars s)) $ \(surf, b) ->
         forM_ [ (x0, x1, f) | (x0, x1, f) <- bHits b, sX se >= x0, sX se < x1 ] $ \(x0, x1, f) ->
@@ -1577,6 +1834,7 @@ pointer env p pe = do
             , clickOutput = bOutputName b
             , clickArea = (x0, x1)
             , clickMenu = ePush env . MsgMenu surf (x0, x1)
+            , clickGrid = ePush env . MsgGrid surf (x0, x1)
             }
 
 ------------------------------------------------------------------------------

@@ -37,6 +37,7 @@ library
   default-extensions: LambdaCase
   exposed-modules:
     Waymobar
+    Waymobar.Apps
     Waymobar.Audio
     Waymobar.Bar
     Waymobar.Calendar

@@ -19,6 +19,7 @@ module Waymobar.Draw
   , withFont
   , TextLayout
   , withMarkup
+  , withMarkupBox
   , layoutSize
   , showLayout
   , validMarkup
@@ -129,6 +130,16 @@ foreign import ccall unsafe "pango_layout_set_markup"
   c_set_markup :: Ptr PangoLayout -> CString -> CInt -> IO ()
 foreign import ccall unsafe "waymobar_align_tabs"
   c_align_tabs :: Ptr PangoLayout -> CInt -> IO ()
+foreign import ccall unsafe "pango_layout_set_width"
+  c_set_width :: Ptr PangoLayout -> CInt -> IO ()
+foreign import ccall unsafe "pango_layout_set_height"
+  c_set_height :: Ptr PangoLayout -> CInt -> IO ()
+foreign import ccall unsafe "pango_layout_set_wrap"
+  c_set_wrap :: Ptr PangoLayout -> CInt -> IO ()
+foreign import ccall unsafe "pango_layout_set_ellipsize"
+  c_set_ellipsize :: Ptr PangoLayout -> CInt -> IO ()
+foreign import ccall unsafe "pango_layout_set_alignment"
+  c_set_alignment :: Ptr PangoLayout -> CInt -> IO ()
 foreign import ccall unsafe "pango_layout_get_pixel_size"
   c_pixel_size :: Ptr PangoLayout -> Ptr CInt -> Ptr CInt -> IO ()
 foreign import ccall unsafe "pango_parse_markup"
@@ -194,6 +205,18 @@ withMarkup (Canvas cr) (Font f) markup act =
     B.useAsCString (utf8 m) $ \s -> c_set_markup l s (-1)
     c_align_tabs l 14
     act (TextLayout l)
+
+-- | Like 'withMarkup', in a box @width@ pixels wide: centred, wrapped at
+-- words, and cut with "…" after @lines@ lines.
+withMarkupBox :: Canvas -> Font -> Double -> Int -> String -> (TextLayout -> IO a) -> IO a
+withMarkupBox cv fnt width lines' markup act =
+  withMarkup cv fnt markup $ \tl@(TextLayout l) -> do
+    c_set_width l (round (width * 1024))      -- pango units
+    c_set_height l (negate (fromIntegral (max 1 lines')))  -- negative: lines
+    c_set_wrap l 0                            -- PANGO_WRAP_WORD
+    c_set_ellipsize l 3                       -- PANGO_ELLIPSIZE_END
+    c_set_alignment l 1                       -- PANGO_ALIGN_CENTER
+    act tl
 
 -- | Width and height in (logical) pixels.
 layoutSize :: TextLayout -> IO (Int, Int)

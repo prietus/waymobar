@@ -19,6 +19,8 @@ module Waymobar.Core
   , Button (..)
   , MenuEntry (..)
   , menuItem
+  , IconGrid (..)
+  , GridEntry (..)
   , Icon
   , IconSource (..)
   , Style (..)
@@ -134,6 +136,23 @@ data Click = Click
   , clickOutput :: Output              -- ^ the output of the bar that was clicked
   , clickArea   :: (Double, Double)    -- ^ left and right edge of the clicked block
   , clickMenu   :: [MenuEntry] -> IO () -- ^ open a menu under the clicked block
+  , clickGrid   :: IconGrid -> IO ()     -- ^ open a grid of icons under the clicked block (an application launcher)
+  }
+
+-- | A grid of icons with a label under each, opened under a block like a
+-- menu: a click on one runs its action; the wheel scrolls it when there
+-- are more rows than 'gridRows'.
+data IconGrid = IconGrid
+  { gridColumns  :: Int
+  , gridRows     :: Int    -- ^ rows shown at once
+  , gridIconSize :: Int    -- ^ logical pixels
+  , gridEntries  :: [GridEntry]
+  }
+
+data GridEntry = GridEntry
+  { gridLabel  :: String           -- ^ plain text
+  , gridIcon   :: Maybe IconSource
+  , gridAction :: IO ()
   }
 
 -- | An entry of a popup menu (see 'clickMenu').

@@ -116,6 +116,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
 | `weather cfg f` | the current weather, from Open-Meteo (see below) |
+| `appLauncher cfg label` | a grid of the installed applications, like GNOME's (see below) |
 | `withCalendar cfg w`, `calendar cfg f` | the agenda of iCloud, Google, CalDAV and iCal calendars, in a popover under the clock or as a widget (see below) |
 | `text markup` | fixed text |
 | `periodic secs io` | any `IO String` (`readCommand` gives a command's first line) |
@@ -158,6 +159,37 @@ It uses `fgColor` and `menuBorder`, and these fields of the configuration:
 
 The shadow and the fade are drawn by waymobar itself, so they look the
 same in every compositor.
+
+### Application launcher
+
+`appLauncher defaultLauncher label` is a block that opens a grid of the
+installed applications on left click, like GNOME's: icon and name, the
+one under the pointer lit up, a click starts it. They come from the
+`.desktop` files of `~/.local/share/applications` and of every
+`applications` directory in `$XDG_DATA_DIRS` (Flatpak's too), read again
+every time it opens; those hidden or meant for another desktop
+(`NoDisplay`, `OnlyShowIn`...) are left out. They are started with
+`gtk-launch`, or from their `Exec` line without it.
+
+```haskell
+-- the Arch Linux logo, from the Symbols Nerd Font
+appLauncher defaultLauncher { launcherColumns = 7, launcherRows = 6 }
+  "<span font_family='Symbols Nerd Font' foreground='#1793d1'>\xf303</span>"
+```
+
+| Field | Default | |
+|---|---|---|
+| `launcherColumns` | `6` | |
+| `launcherRows` | `5` | rows shown at once; the wheel scrolls the rest |
+| `launcherIconSize` | `48` | logical pixels |
+| `launcherTerminal` | `"foot"` | for applications that run in a terminal, when there is no `gtk-launch` |
+
+The grid looks like the menus (`popoverBg`, `menuHighlight`...).
+`listApps` and `launchApp` give the applications to other widgets, and
+`clickGrid` (in a `Click`) opens any grid of icons under a block:
+`IconGrid` with `gridColumns`, `gridRows`, `gridIconSize` and
+`gridEntries`, each a `GridEntry` with a label, an optional
+`IconSource` and an action.
 
 ### Side panel
 
