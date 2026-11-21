@@ -5,6 +5,7 @@
 -- @curl@, so no TLS library is needed.
 module Waymobar.Weather
   ( Weather (..)
+  , WeatherAlert (..)
   , WeatherConfig (..)
   , Location (..)
   , Units (..)
@@ -19,6 +20,7 @@ module Waymobar.Weather
   , fetchWeather
   , httpJson
   , httpJsonWith
+  , wtrAlerts
   ) where
 
 import Control.Concurrent (forkIO)
@@ -29,6 +31,8 @@ import qualified Data.ByteString as B
 import Data.Char (isAlphaNum)
 import Data.IORef
 import Data.Maybe (listToMaybe)
+import Data.Time (defaultTimeLocale, formatTime, getTimeZone, parseTimeM, utcToLocalTime)
+import Data.Time.Clock (UTCTime)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Numeric (showFFloat, showHex)
@@ -92,6 +96,17 @@ data Weather = Weather
   , weatherWind      :: Int
   , weatherCode      :: Int     -- ^ WMO weather code: 0 clear, 3 overcast, 61 rain, 95 thunderstorm...
   , weatherIsDay     :: Bool
+  , weatherAlerts    :: [WeatherAlert]
+    -- ^ active severe weather warnings (Open-Meteo has none: @[]@)
+  } deriving (Eq, Show)
+
+-- | A severe weather warning, e.g. from WeatherKit (AEMET, Meteoalarm...).
+data WeatherAlert = WeatherAlert
+  { alertLevel       :: String        -- ^ @"green"@, @"yellow"@, @"orange"@, @"red"@ or @""@
+  , alertDescription :: String        -- ^ e.g. @"Thunderstorms"@
+  , alertArea        :: String        -- ^ @""@ when unknown
+  , alertOnset       :: String        -- ^ when it starts, local time (@"Sat 22 14:00"@), @""@ when unknown
+  , alertEnds        :: String        -- ^ when it ends, the same
   } deriving (Eq, Show)
 
 -- | The weather, refreshed every 'weatherInterval' seconds; @f@ gets
@@ -218,6 +233,7 @@ fetchWeather units p = do
       , weatherWind = round wind
       , weatherCode = round code
       , weatherIsDay = day /= 0
+      , weatherAlerts = []
       }
   where
     coord x = showFFloat (Just 4) x ""
@@ -293,6 +309,30 @@ weatherDescription w = case weatherCode w of
   96 -> "Thunderstorm with hail"
   99 -> "Thunderstorm with heavy hail"
   _ -> "Unknown"
+
+-- | The warnings in the answer of a wtr server to @?view=alerts&format=json@:
+-- @{"active": [{"level": "yellow", "description": "...", "onset": "...", "ends": "...", "area": "..."}]}@.
+-- The times are turned to local time.
+wtrAlerts :: JValue -> IO [WeatherAlert]
+wtrAlerts o = case lookupKey "active" o of
+  Just (JArr as) -> mapM alert as
+  _ -> pure []
+  where
+    alert a = do
+      onset <- local (text' "onset" a)
+      ends <- local (text' "ends" a)
+      pure WeatherAlert
+        { alertLevel = maybe "" id (text' "level" a)
+        , alertDescription = maybe "" id (text' "description" a)
+        , alertArea = maybe "" id (text' "area" a)
+        , alertOnset = onset
+        , alertEnds = ends
+        }
+    local s = case s >>= parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ" :: Maybe UTCTime of
+      Nothing -> pure ""
+      Just t -> do
+        z <- getTimeZone t
+        pure (formatTime defaultTimeLocale "%a %e %H:%M" (utcToLocalTime z t))
 
 ------------------------------------------------------------------------------
 
