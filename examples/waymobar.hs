@@ -41,8 +41,8 @@ main = waymobar def
       ]
   , center = [ windowTitle 70 ]
   , right =
-      [ colored "#8ec07c" (cpu (\p -> sym "memory" ++ show p ++ "%"))
-      , colored "#d3869b" (memory (\p -> sym "memory_alt" ++ show p ++ "%"))
+      [ colored "#8ec07c" (cpu (\p -> sym "memory" ++ pct p))
+      , colored "#d3869b" (memory (\p -> sym "memory_alt" ++ pct p))
       , command "uname -r" 3600
       , spawnOnClick "foot" (text (symbol "add"))
         -- 'clock' escapes its text, so the icon is added afterwards
@@ -51,6 +51,13 @@ main = waymobar def
     -- push the pointer against the right edge of the screen
   , sidePanel = Just sessionPanel
   }
+
+-- | A percentage always three figures wide, filled with zeros ("007%"), so
+-- the bar does not move when it goes from 9% to 10% or to 100%. (With a
+-- proportional font, add font_features='tnum' so all digits are equally
+-- wide.)
+pct :: Int -> String
+pct p = replicate (3 - length (show p)) '0' ++ show p ++ "%"
 
 -- | Hidden at the right edge: a column of icons to rebuild and restart
 -- waymobar or rivermonad, log out, reboot and power off. With the pointer
