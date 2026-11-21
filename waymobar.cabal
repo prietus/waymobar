@@ -52,6 +52,7 @@ library
     Waymobar.Main
     Waymobar.Media
     Waymobar.Network
+    Waymobar.Power
     Waymobar.Recompile
     Waymobar.Rivermonad
     Waymobar.Tray

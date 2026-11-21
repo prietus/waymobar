@@ -116,6 +116,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
 | `weather cfg f` | the current weather, from Open-Meteo (see below) |
+| `powerProfile f`, `powerProfileHover f g` | the power profile of power-profiles-daemon; click to switch (see below) |
 | `appLauncher cfg label` | a grid of the installed applications, like GNOME's (see below) |
 | `withCalendar cfg w`, `calendar cfg f` | the agenda of iCloud, Google, CalDAV and iCal calendars, in a popover under the clock or as a widget (see below) |
 | `text markup` | fixed text |
@@ -159,6 +160,30 @@ It uses `fgColor` and `menuBorder`, and these fields of the configuration:
 
 The shadow and the fade are drawn by waymobar itself, so they look the
 same in every compositor.
+
+### Power profile
+
+`powerProfile f` shows the profile of power-profiles-daemon (or
+tuned-ppd), over D-Bus on the system bus, and follows changes made
+elsewhere (`powerprofilesctl`, GNOME's settings) at once. A left click
+moves to the next profile, the wheel goes up and down them, and a right
+click opens a menu to pick one. `f` gets `Nothing` when there is no
+daemon, or a `PowerState` with `powerActive` (`PowerSaver`, `Balanced`,
+`Performance`), `powerAvailable` (performance needs a driver for it) and
+`powerDegraded` (why performance is held back, `""` if it is not);
+`profileName` says a profile in words. `powerProfileHover f g` adds a
+popover with `g`'s markup.
+
+```haskell
+powerProfileHover
+  (\case
+     Nothing -> ""
+     Just p -> case powerActive p of
+       PowerSaver -> "eco"
+       Balanced -> "bal"
+       Performance -> "perf")
+  (\p -> "<b>" ++ profileName (powerActive p) ++ "</b>")
+```
 
 ### Application launcher
 
