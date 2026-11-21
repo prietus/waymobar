@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 -- ~/.config/waymobar/waymobar.hs
 --
 -- waymobar rebuilds this file when it changes (like xmonad). Check it with
@@ -41,7 +42,11 @@ main = waymobar def
       ]
   , center = [ windowTitle 70 ]
   , right =
-      [ colored "#8ec07c" (cpu (\p -> sym "memory" ++ pct p))
+        -- cable or Wi-Fi, and the download speed
+      [ colored "#83a598" (network 3 (\case
+          Nothing -> sym "wifi_off" ++ "offline"
+          Just n -> sym (if netKind n == Wifi then "wifi" else "lan") ++ rate (netRxRate n)))
+      , colored "#8ec07c" (cpu (\p -> sym "memory" ++ pct p))
       , colored "#d3869b" (memory (\p -> sym "memory_alt" ++ pct p))
       , command "uname -r" 3600
       , spawnOnClick "foot" (text (symbol "add"))
@@ -52,12 +57,28 @@ main = waymobar def
   , sidePanel = Just sessionPanel
   }
 
--- | A percentage always three figures wide, filled with zeros ("007%"), so
--- the bar does not move when it goes from 9% to 10% or to 100%. (With a
--- proportional font, add font_features='tnum' so all digits are equally
--- wide.)
+-- | A percentage always three figures wide ("007%"), so the bar does not
+-- move when it goes from 9% to 10% or to 100%.
 pct :: Int -> String
-pct p = replicate (3 - length (show p)) '0' ++ show p ++ "%"
+pct p = figures p ++ "%"
+
+-- | A speed (bytes per second) always as wide: three figures in KB/s, MB/s
+-- or GB/s ("042 KB/s", "003 MB/s").
+rate :: Double -> String
+rate r = figures v ++ " " ++ [u] ++ "B/s"
+  where
+    (v, u) = case [ (n, c) | (k, c) <- [(1e3, 'K'), (1e6, 'M'), (1e9, 'G')], let n = round (r / k), n < 1000 ] of
+      (x : _) -> x
+      [] -> (999, 'G')
+
+-- | A number three figures wide, the zeros in front dimmed: "007". (With a
+-- proportional font, add font_features='tnum' so all digits are equally
+-- wide, and mind that its letters are not: an "M" is wider than a "K".)
+figures :: Int -> String
+figures n = dimZeros ++ show n
+  where
+    zeros = replicate (3 - length (show n)) '0'
+    dimZeros = if null zeros then "" else "<span foreground='#928374'>" ++ zeros ++ "</span>"
 
 -- | Hidden at the right edge: a column of icons to rebuild and restart
 -- waymobar or rivermonad, log out, reboot and power off. With the pointer
