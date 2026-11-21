@@ -15,6 +15,8 @@ module Waymobar.Core
   , Output
   , Block (..)
   , block
+  , Ticker (..)
+  , ticker
   , Click (..)
   , Button (..)
   , MenuEntry (..)
@@ -229,11 +231,30 @@ data Block = Block
   , blockIconRecolorAll :: Bool              -- ^ recolour every icon, not only @-symbolic@ ones
   , blockGroupStyle     :: Maybe Style       -- ^ a box behind all the blocks of the widget (from its first block)
   , blockHoverMarkup    :: Maybe String      -- ^ shown in a popover under the block while the pointer is on it (may have several lines)
+  , blockTicker         :: Maybe Ticker      -- ^ scrolling text after the markup (see 'Ticker')
   }
+
+-- | Text that scrolls smoothly, pixel by pixel, in a window of a fixed
+-- width after the markup of its block, like a news ticker. Text that fits
+-- in the window stays still (and the window shrinks to it). While it
+-- scrolls the bar is drawn on every frame the compositor shows, and the
+-- text fades out at the edges of the window.
+data Ticker = Ticker
+  { tickerMarkup :: String   -- ^ pango markup, one line
+  , tickerWidth  :: Int      -- ^ logical pixels of the window
+  , tickerSpeed  :: Double   -- ^ logical pixels per second
+  , tickerGap    :: Int      -- ^ space between the end of the text and its next start
+  , tickerPause  :: Double   -- ^ seconds still at the start, when the text appears
+  } deriving (Eq, Show)
+
+-- | A ticker @width@ pixels wide, at 40 px/s, with a gap of 60 px and
+-- a pause of 2 s.
+ticker :: Int -> String -> Ticker
+ticker w m = Ticker { tickerMarkup = m, tickerWidth = w, tickerSpeed = 40, tickerGap = 60, tickerPause = 2 }
 
 -- | A block showing some markup, without padding or click handler.
 block :: String -> Block
-block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False Nothing Nothing
+block m = Block m noStyle 0 0 Nothing Nothing 0 Nothing Nothing False Nothing Nothing Nothing
 
 styled :: Style -> Block -> Block
 styled s b = b { blockStyle = s }

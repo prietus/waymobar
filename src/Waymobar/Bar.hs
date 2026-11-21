@@ -22,7 +22,8 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (find, findIndex, zip4)
+import Data.List (find, findIndex, sortBy, zip4)
+import Data.Ord (Down (..), comparing)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import qualified Data.Text as T
@@ -112,6 +113,7 @@ data Bar = Bar
   , bHoverX     :: Maybe Double                -- ^ pointer position, for hover styles
   , bHoverRects :: [(Double, Double)]          -- ^ blocks that have a hover style
   , bTips       :: [(Double, Double, String)]  -- ^ blocks with hover markup, shown in a popover
+  , bFrame      :: Maybe ObjectId              -- ^ pending frame callback while a ticker scrolls
   }
 
 -- | The popover showing the hover markup of a block. It takes no input:
@@ -224,6 +226,7 @@ data Env = Env
   , eState   :: IORef S
   , eSync    :: ObjectId
   , ePush    :: Msg -> IO ()
+  , eTickers :: IORef (M.Map String (Double, Double))  -- ^ ticker markup -> (when it appeared, when last drawn)
   }
 
 -- | Run the bar until the compositor goes away.
@@ -258,7 +261,8 @@ runBar cfg = do
     , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing, sGrid = Nothing
     , sStrips = M.empty, sPanel = Nothing, sPanelGen = 0
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
-  let env = Env conn reg cfg h ws pws st sync push
+  tickers <- newIORef M.empty
+  let env = Env conn reg cfg h ws pws st sync push tickers
   let loop = do
         first <- atomically (readTQueue q)
         rest <- atomically (flushTQueue q)
@@ -363,6 +367,10 @@ event env ev = case ev of
     forM_ mgp $ \gp -> when (gpFrame gp == Just cb) $ do
       modifyIORef' st $ \s -> s { sGrid = Just gp { gpFrame = Nothing } }
       updSurf (gpSurface gp) (\sf -> sf { sfDirty = True })
+    bars <- sBars <$> readIORef st
+    forM_ [ b | b <- M.elems bars, bFrame b == Just cb ] $ \b -> do
+      modifyIORef' st $ \s -> s { sBars = M.adjust (\b' -> b' { bFrame = Nothing }) (bSurface b) (sBars s) }
+      updSurf (bSurface b) (\sf -> sf { sfDirty = True })
     mpl <- sPanel <$> readIORef st
     forM_ mpl $ \pl -> when (plFrame pl == Just cb) $ do
       modifyIORef' st $ \s -> s { sPanel = Just pl { plFrame = Nothing } }
@@ -514,8 +522,15 @@ redrawDirty env = do
   forM_ (M.elems (sBars s)) $ \b -> forM_ (M.lookup (bSurface b) (sSurfs s)) $ \sf ->
     when (sfDirty sf && sfConfigured sf) $ do
       let surf = sfSurface sf
-      res <- present env sf $ \cv -> paintBar env cv (bOutputName b) (bHoverX b) (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
-      forM_ res $ \(hs, hr, ts) -> modifyIORef' (eState env) $ \s' -> s' { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bTips = ts }) surf (sBars s') }
+      res <- present env sf $ \cv -> do
+        (hs, hr, ts, moving) <- paintBar env cv (bOutputName b) (bHoverX b) (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+        -- a ticker scrolls: draw again as soon as the compositor shows this frame
+        f <- if moving && isNothing (bFrame b)
+          then Just <$> wlSurfaceFrame (eConn env) surf
+          else pure Nothing
+        pure (hs, hr, ts, f)
+      forM_ res $ \(hs, hr, ts, f) -> modifyIORef' (eState env) $ \s' -> s'
+        { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bTips = ts, bFrame = maybe (bFrame b') Just f }) surf (sBars s') }
   -- the strips of the side panel: nothing to see
   forM_ (M.elems (sStrips s)) $ \t -> forM_ (M.lookup (stSurface t) (sSurfs s)) $ \sf ->
     when (sfDirty sf && sfConfigured sf) $ void $ present env sf $ \cv -> clear cv (Color 0 0 0 0)
@@ -650,7 +665,7 @@ createBar env o out = do
     wlSurfaceCommit c surf
     modifyIORef' st $ \s -> s
       { sSurfs = M.insert surf sf { sfH = eHeight env } (sSurfs s)
-      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing [] []) (sBars s)
+      , sBars = M.insert surf (Bar surf ls o (fromMaybe "" (oName out)) [] Nothing [] [] Nothing) (sBars s)
       , sOutputs = M.adjust (\x -> x { oBar = Just surf }) o (sOutputs s) }
   where
     c = eConn env
@@ -681,12 +696,12 @@ destroyBar env b = do
 -- | Draw a bar; returns its click areas, the areas whose look changes
 -- under the pointer, and the blocks with hover markup (for the popover).
 paintBar :: Env -> Canvas -> Output -> Maybe Double -> Double -> Double
-         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], [(Double, Double, String)])
+         -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], [(Double, Double, String)], Bool)
 paintBar env cv out hoverX w h = do
   let cfg = eCfg env
       (ls, cs, rs) = eWidgets env
       hasIcon b = isJust (blockIcon b) || isJust (blockIconSource b)
-      visible b = not (null (blockMarkup b)) || hasIcon b
+      visible b = not (null (blockMarkup b)) || hasIcon b || isJust (blockTicker b)
       -- widgets with nothing to show take no room (nor spacing)
       blocksOf = fmap (filter (not . null)) . mapM (\f -> filter visible <$> safe (f out))
   -- the bar itself: transparent outside its (possibly rounded) box
@@ -695,7 +710,13 @@ paintBar env cv out hoverX w h = do
   fillRounded cv 0 0 w h (barRadius cfg)
   forM_ (barBorder cfg) $ \(bw, bc) -> setColor cv (color bc) >> strokeRounded cv 0 0 w h (barRadius cfg) bw
   devScale <- canvasScale cv
-  let -- Icons with a source are rasterized at the real (device) size, so
+  now <- getMonotonicTime
+  moving <- newIORef False
+  -- when every ticker first appeared (its scroll starts from there)
+  let tickerStart m = atomicModifyIORef' (eTickers env) $ \mp ->
+        let t0 = maybe now fst (M.lookup m mp)
+        in (M.filter (\(_, seen) -> now - seen < 1) (M.insert m (t0, now) mp), t0)
+      -- Icons with a source are rasterized at the real (device) size, so
       -- SVGs stay sharp at any output scale; the bitmap is a fallback.
       blockBitmap b st isz = case blockIconSource b of
         Nothing -> pure (blockIcon b)
@@ -712,14 +733,17 @@ paintBar env cv out hoverX w h = do
         iconPart b
           | hasIcon b = iconSize b + (if null (blockMarkup b) then 0 else 4)
           | otherwise = 0
-        measure bss k = withLayouts cv fnt (map blockMarkup (concat bss)) $ \lays -> do
-          ws <- forM (zip (concat bss) lays) $ \(b, l) -> do
+        measure bss k = withLayouts cv fnt (map blockMarkup (concat bss)) $ \lays ->
+         withLayouts cv fnt (map (maybe "" tickerMarkup . blockTicker) (concat bss)) $ \tlays -> do
+          ws <- forM (zip3 (concat bss) lays tlays) $ \(b, l, tl) -> do
             (tw, th) <- layoutSize l
+            tsz <- layoutSize tl
             let st = blockStyle b
                 (_, mh) = boxMargin st
                 textW = if null (blockMarkup b) then 0 else fromIntegral tw
-                inner = iconPart b + textW + 2 * (fromIntegral (blockPadding b) + boxPadding st)
-            pure (max (fromIntegral (blockMinWidth b)) inner + 2 * mh, th)
+                tick = (\t -> (t, tl, tsz)) <$> blockTicker b
+                inner = iconPart b + textW + maybe 0 tickerWindow tick + 2 * (fromIntegral (blockPadding b) + boxPadding st)
+            pure (max (fromIntegral (blockMinWidth b)) inner + 2 * mh, (th, tick))
           k (regroup bss (zip3 (concat bss) lays ws))
         sp = fromIntegral (widgetSpacing cfg)
         pad = fromIntegral (edgePadding cfg)
@@ -735,11 +759,34 @@ paintBar env cv out hoverX w h = do
           forM_ (groupStyleOf g) $ \gs -> do
             let gst = if hovered gx (groupWidth g) then maybe gs (`mergeStyle` gs) (styleHover gs) else gs
             drawBox cv gst gx (groupWidth g) h
-          fmap cat3 $ forM (zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, th))) -> do
+          fmap cat3 $ forM (zip (scanl (+) (gx + groupInset g) [ bw | (_, _, (bw, _)) <- g ]) g) $ \(x, (b, l, (bw, (th, tick)))) -> do
             let base = blockStyle b
                 st = if hovered x bw then maybe base (`mergeStyle` base) (styleHover base) else base
             ic <- blockBitmap b st (iconSize b)
-            drawBlock cfg cv b { blockIcon = ic, blockStyle = st } l x bw h th (iconSize b)
+            tx <- drawBlock cfg cv b { blockIcon = ic, blockStyle = st } l x bw h th (iconSize b)
+            forM_ tick $ \tk@(t, tl, (ttw, tth)) -> do
+              let win = tickerWindow tk
+                  tw' = fromIntegral ttw
+                  -- what fits stays still; otherwise it scrolls, stopping
+                  -- for 'tickerPause' every time it is back at its start
+                  scrolls = tw' > win
+                  period = tw' + fromIntegral (max 0 (tickerGap t))
+                  speed = max 1 (tickerSpeed t)
+                  pause = max 0 (tickerPause t)
+                  cyc = pause + period / speed
+                  ty = fromIntegral (round ((h - fromIntegral tth) / 2) :: Int)
+                  -- whole device pixels, so the glyphs don't shimmer
+                  snap v = fromIntegral (round (v * devScale) :: Int) / devScale
+              off <- if not scrolls then pure 0 else do
+                t0 <- tickerStart (tickerMarkup t)
+                writeIORef moving True
+                let tc = (now - t0) - cyc * fromIntegral (floor ((now - t0) / cyc) :: Int)
+                pure (snap (max 0 (tc - pause) * speed))
+              let fade = 14
+              setColor cv (color (fromMaybe (fgColor cfg) (styleFg st)))
+              withEdgeFade cv tx 0 win h (if scrolls then min fade off else 0) (if scrolls then fade else 0) $ do
+                showLayout cv tl (tx - off) ty
+                when scrolls $ showLayout cv tl (tx - off + period) ty
             pure ( [ (x, x + bw, f) | Just f <- [blockOnClick b] ]
                  , [ (x, x + bw) | isJust (styleHover base) ]
                  , [ (x, x + bw, m) | Just m <- [blockHoverMarkup b], not (null m) ] )
@@ -748,7 +795,14 @@ paintBar env cv out hoverX w h = do
         groupRects x0 gs = [ (gx, gx + groupWidth g)
                            | (gx, g) <- zip (scanl (\x g -> x + groupWidth g + sp) x0 gs) gs
                            , Just gs' <- [groupStyleOf g], isJust (styleHover gs') ]
-    measure lb0 $ \lgs -> measure cb0 $ \cgs -> measure rb0 $ \rgs -> do
+    measure lb0 $ \lgs -> measure cb0 $ \cgs0 -> measure rb0 $ \rgs -> do
+      -- The center gets the room the left and right sides leave: when it
+      -- does not fit, its longest texts are cut with "…" (and it goes away
+      -- when there is next to no room at all).
+      let room = w - 2 * pad - totalWidth lgs - totalWidth rgs - 2 * sp
+      cgs <- if totalWidth cgs0 <= room then pure cgs0
+             else if room < 40 then pure []
+             else fitCenter (totalWidth cgs0 - room) cgs0
       let lw = totalWidth lgs
           rw = totalWidth rgs
           cw = totalWidth cgs
@@ -757,15 +811,36 @@ paintBar env cv out hoverX w h = do
       (h1, r1, t1) <- drawGroups pad lgs
       (h2, r2, t2) <- drawGroups cx cgs
       (h3, r3, t3) <- drawGroups rx rgs
+      mv <- readIORef moving
       pure ( h1 ++ h2 ++ h3
            , r1 ++ r2 ++ r3 ++ groupRects pad lgs ++ groupRects cx cgs ++ groupRects rx rgs
-           , t1 ++ t2 ++ t3 )
+           , t1 ++ t2 ++ t3
+           , mv )
   where
     safe act = act `E.catch` \(e :: E.SomeException) -> do
       hPutStrLn stderr ("waymobar: widget failed: " ++ show e)
       pure []
     regroup [] _ = []
     regroup (g : gs) xs = let (a, b) = splitAt (length g) xs in a : regroup gs b
+    -- Shrink the texts of the center by @over@ pixels in all, the longest
+    -- first (each one down to 'minText' at most).
+    fitCenter over gs = do
+      let flat = concat gs
+      tws <- forM flat $ \(b, l, _) -> if null (blockMarkup b) then pure 0 else fromIntegral . fst <$> layoutSize l
+      let order = map snd (sortBy (comparing (Down . fst)) (zip tws [0 :: Int ..]))
+          cuts = snd (foldl (\(left, acc) i ->
+                    let c = max 0 (min left ((tws !! i) - minText)) in (left - c, M.insert i c acc))
+                    (over, M.empty) order)
+      flat' <- forM (zip3 [0 ..] flat tws) $ \(i, (b, l, (bw, x)), tw) -> case M.lookup i cuts of
+        Just c | c > 0 -> do
+          ellipsizeLayout l (tw - c)
+          (nw, _) <- layoutSize l
+          pure (b, l, (bw - (tw - fromIntegral nw), x))
+        _ -> pure (b, l, (bw, x))
+      pure (regroup gs flat')
+    minText = 60
+    -- the window of a ticker: its width, or less when the text is shorter
+    tickerWindow (t, _, (ttw, _)) = min (fromIntegral (max 0 (tickerWidth t))) (fromIntegral ttw)
 
 boxMargin :: Style -> (Double, Double)
 boxMargin = fromMaybe (0, 0) . styleMargin
@@ -798,7 +873,8 @@ withLayouts cv fnt (m : ms) k = withMarkup cv fnt m $ \l -> withLayouts cv fnt m
 color :: String -> Color
 color s = fromMaybe (Color 0 0 0 1) (parseColor s)
 
-drawBlock :: Config -> Canvas -> Block -> TextLayout -> Double -> Double -> Double -> Int -> Double -> IO ()
+-- | Draw a block; returns where its markup ends (a ticker goes there).
+drawBlock :: Config -> Canvas -> Block -> TextLayout -> Double -> Double -> Double -> Int -> Double -> IO Double
 drawBlock cfg cv b l x bw h th isz = do
   let st = blockStyle b
       (_, mh) = boxMargin st
@@ -809,9 +885,11 @@ drawBlock cfg cv b l x bw h th isz = do
     Just icon -> do
       drawIcon cv icon (x + mh + pad) (fromIntegral (round ((h - isz) / 2) :: Int)) isz
       pure (x + mh + pad + isz + 4)
-  unless (null (blockMarkup b)) $ do
+  if null (blockMarkup b) then pure tx else do
     setColor cv (color (fromMaybe (fgColor cfg) (styleFg st)))
     showLayout cv l tx (fromIntegral (round ((h - fromIntegral th) / 2) :: Int))
+    (tw, _) <- layoutSize l
+    pure (tx + fromIntegral tw)
 
 ------------------------------------------------------------------------------
 -- Menus
@@ -1673,7 +1751,7 @@ paintPanel env cv pl alpha _ h = do
           Just src -> do
             let Color r g bl _ = color (fromMaybe (fromMaybe (fgColor cfg) (styleFg st)) (blockIconColor b))
             maybe (blockIcon b) Just <$> resolveIcon src (max 1 (round (isz * devScale))) (Just (r, g, bl)) (blockIconRecolorAll b)
-        withTranslate cv 0 y0 $
+        withTranslate cv 0 y0 $ void $
           drawBlock cfg cv b { blockStyle = st, blockIcon = ic, blockPadding = round (rowPad b) - round (boxPadding st) }
             l rx rw (y1 - y0) th isz
         pure ( [ (y0, y1, f) | Just f <- [blockOnClick b] ], [ (y0, y1) | isJust hov ]

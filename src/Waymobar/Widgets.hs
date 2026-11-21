@@ -5,6 +5,7 @@ module Waymobar.Widgets
   , periodic
   , periodicIO
   , periodicHoverIO
+  , periodicTickerIO
   , clock
   , command
   , commandMarkup
@@ -51,7 +52,7 @@ import Control.Monad (forever, unless, void, when)
 import Data.Char (toLower)
 import Data.IORef
 import Data.List (isSuffixOf)
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime, getCurrentTime, utctDayTime)
 import System.Directory (listDirectory)
 import System.Exit (ExitCode (..))
@@ -94,6 +95,25 @@ periodicHoverIO secs setup = Widget $ \env -> do
     unless (s == old) (redraw env)
     threadDelay (round (secs * 1000000))
   pure $ \_ -> (\(s, h) -> [ (block s) { blockHoverMarkup = if null h then Nothing else Just h } | not (null s) ]) <$> readIORef ref
+
+-- | Like 'periodicHoverIO', with a 'Ticker': every sample is the markup
+-- of the bar (an icon, say), the text that scrolls after it ('Nothing':
+-- none) and the markup of the popover. Hidden when there is neither
+-- markup nor ticker. The scrolling itself is drawn by the bar, smoothly,
+-- whatever @secs@ is; a ticker whose text changes starts again.
+periodicTickerIO :: Double -> IO (IO (String, Maybe Ticker, String)) -> Widget
+periodicTickerIO secs setup = Widget $ \env -> do
+  act <- setup
+  ref <- newIORef ("", Nothing, "")
+  void $ forkIO $ forever $ do
+    r <- E.try act
+    let s = either (\e -> const ("", Nothing, "") (e :: E.SomeException)) id r
+    old <- atomicModifyIORef' ref (\o -> (s, o))
+    unless (s == old) (redraw env)
+    threadDelay (round (secs * 1000000))
+  pure $ \_ -> (\(m, t, h) ->
+    [ (block m) { blockTicker = t, blockHoverMarkup = if null h then Nothing else Just h }
+    | not (null m) || isJust t ]) <$> readIORef ref
 
 -- | The local time, with a 'formatTime' format such as @"%a %d %b %H:%M"@.
 -- Updates on the second.

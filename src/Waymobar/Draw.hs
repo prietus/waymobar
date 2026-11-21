@@ -13,6 +13,7 @@ module Waymobar.Draw
   , withFade
   , withFadeXY
   , withTranslate
+  , withEdgeFade
   , clear
     -- * Text
   , Font
@@ -21,6 +22,7 @@ module Waymobar.Draw
   , withMarkup
   , withMarkupBox
   , layoutSize
+  , ellipsizeLayout
   , showLayout
   , validMarkup
   , escapeMarkup
@@ -47,6 +49,7 @@ import Data.Word (Word8)
 data CairoSurface
 data Cairo
 data PangoLayout
+data CairoPattern
 data PangoFontDescription
 
 -- | A cairo context drawing into a block of ARGB32 pixels.
@@ -113,6 +116,17 @@ foreign import ccall unsafe "cairo_pop_group_to_source"
   c_pop_group_to_source :: Ptr Cairo -> IO ()
 foreign import ccall unsafe "cairo_paint_with_alpha"
   c_paint_with_alpha :: Ptr Cairo -> CDouble -> IO ()
+
+foreign import ccall unsafe "cairo_clip"
+  c_clip :: Ptr Cairo -> IO ()
+foreign import ccall unsafe "cairo_pattern_create_linear"
+  c_pattern_create_linear :: CDouble -> CDouble -> CDouble -> CDouble -> IO (Ptr CairoPattern)
+foreign import ccall unsafe "cairo_pattern_add_color_stop_rgba"
+  c_pattern_add_color_stop_rgba :: Ptr CairoPattern -> CDouble -> CDouble -> CDouble -> CDouble -> CDouble -> IO ()
+foreign import ccall unsafe "cairo_pattern_destroy"
+  c_pattern_destroy :: Ptr CairoPattern -> IO ()
+foreign import ccall unsafe "cairo_mask"
+  c_mask :: Ptr Cairo -> Ptr CairoPattern -> IO ()
 
 foreign import ccall unsafe "pango_cairo_create_layout"
   c_create_layout :: Ptr Cairo -> IO (Ptr PangoLayout)
@@ -217,6 +231,12 @@ withMarkupBox cv fnt width lines' markup act =
     c_set_ellipsize l 3                       -- PANGO_ELLIPSIZE_END
     c_set_alignment l 1                       -- PANGO_ALIGN_CENTER
     act tl
+
+-- | Cut a layout to @width@ pixels, ending in "…" (one line).
+ellipsizeLayout :: TextLayout -> Double -> IO ()
+ellipsizeLayout (TextLayout l) width = do
+  c_set_width l (round (max 0 width * 1024))   -- pango units
+  c_set_ellipsize l 3                          -- PANGO_ELLIPSIZE_END
 
 -- | Width and height in (logical) pixels.
 layoutSize :: TextLayout -> IO (Int, Int)
@@ -350,5 +370,26 @@ withTranslate (Canvas cr) dx dy act = do
   c_save cr
   c_translate cr (realToFrac dx) (realToFrac dy)
   r <- act
+  c_restore cr
+  pure r
+
+-- | Draw only inside the rectangle @(x, y, w, h)@, its left @fadeL@ and
+-- right @fadeR@ pixels fading out to transparent (the window of a ticker).
+withEdgeFade :: Canvas -> Double -> Double -> Double -> Double -> Double -> Double -> IO a -> IO a
+withEdgeFade (Canvas cr) x y w h fadeL fadeR act = do
+  c_save cr
+  c_new_path cr
+  c_rectangle cr (realToFrac x) (realToFrac y) (realToFrac w) (realToFrac h)
+  c_clip cr
+  c_push_group cr
+  r <- act
+  c_pop_group_to_source cr
+  if (fadeL <= 0 && fadeR <= 0) || w <= 0 then c_paint cr else
+    bracket (c_pattern_create_linear (realToFrac x) 0 (realToFrac (x + w)) 0) c_pattern_destroy $ \pat -> do
+      let fl = realToFrac (max 0 (min 0.5 (fadeL / w)))
+          fr = realToFrac (max 0 (min 0.5 (fadeR / w)))
+          stop o a = c_pattern_add_color_stop_rgba pat o 0 0 0 a
+      stop 0 (if fl > 0 then 0 else 1) >> stop fl 1 >> stop (1 - fr) 1 >> stop 1 (if fr > 0 then 0 else 1)
+      c_mask cr pat
   c_restore cr
   pure r
