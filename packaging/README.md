@@ -30,7 +30,7 @@ sudo dnf install rpm-build rpmdevtools dnf-plugins-core
 sudo dnf builddep packaging/fedora/waymobar.spec
 spectool -g -R packaging/fedora/waymobar.spec
 rpmbuild -bb packaging/fedora/waymobar.spec
-sudo dnf install ~/rpmbuild/RPMS/*/{,ghc-}waymobar*-0.2.0-*.rpm
+sudo dnf install ~/rpmbuild/RPMS/*/{,ghc-}waymobar*-0.3.0-*.rpm
 ```
 
 The same spec builds in [COPR](https://copr.fedorainfracloud.org/).
@@ -39,5 +39,5 @@ The same spec builds in [COPR](https://copr.fedorainfracloud.org/).
 
 1. Bump `version:` in `waymobar.cabal`, `pkgver` in the PKGBUILD and
    `Version:` in the spec (plus a `%changelog` entry).
-2. Tag it: `git tag -a v0.2.0 -m "waymobar 0.2.0" && git push --tags`.
+2. Tag it: `git tag -a v0.3.0 -m "waymobar 0.3.0" && git push --tags`.
 3. Update `sha256sums` in the PKGBUILD with `updpkgsums`.
