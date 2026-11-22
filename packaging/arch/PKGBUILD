@@ -18,8 +18,8 @@ optdepends=('rivermonad: workspaces, layout and window title widgets'
             'geoclue: locate the weather without a fixed place'
             'power-profiles-daemon: the power profile widget')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-# Filled in once v0.3.0 is tagged: sha256sum of the GitHub tarball.
-sha256sums=('SKIP')
+
+sha256sums=('db26f477255cdfdaff1cae424adc20c0c27b5143546dcd35a66aa486bc0f379e')
 
 build() {
   cd $pkgname-$pkgver
