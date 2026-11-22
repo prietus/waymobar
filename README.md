@@ -96,6 +96,8 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `outputs` | `[]` | only these outputs (`["DP-1"]`); `[]` = all |
 | `namespace` | `"waymobar"` | layer-shell namespace |
 | `sidePanel` | `Nothing` | a panel hidden at an edge of the screen (see below) |
+| `hotCorners` | `[]` | actions for the corners of the screen (see below) |
+| `hotCornerDelay` | `250` | milliseconds the pointer rests in a corner before its action runs |
 
 ### Widgets
 
@@ -263,6 +265,22 @@ sidePanel = Just defaultSidePanel
 The edge takes the pointer through a 1 px transparent strip (layer-shell
 namespace `waymobar-edge`, the panel is `waymobar-panel`); with
 rivermonad's `gapsWithEdge` it covers no window.
+
+### Hot corners
+
+Push the pointer into a corner of the screen, leave it there a moment and
+something happens, like macOS's hot corners:
+
+```haskell
+hotCorners =
+  [ (TopLeftCorner, spawn "fuzzel")        -- the launcher
+  , (BottomRightCorner, spawn "locklet")   -- lock the screen
+  ]
+```
+
+Each corner is a transparent 1x1 surface above everything, so it works
+over windows too. The action runs once each time the pointer arrives; any
+`IO ()` works, e.g. `sendAction (FocusWorkspace "web")` for rivermonad.
 
 ### Icons
 

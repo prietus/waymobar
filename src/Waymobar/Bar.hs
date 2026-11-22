@@ -60,6 +60,7 @@ data Msg
   | MsgTick                                         -- ^ nothing to do but look at the clock (animations)
   | MsgPanelOpen Int                                -- ^ open the side panel if the pointer still rests at the edge
   | MsgPanelHide Int                                -- ^ close it if the pointer is still away
+  | MsgCorner Int ObjectId                          -- ^ run a hot corner's action if the pointer still rests there
 
 data Globals = Globals
   { gCompositor :: Maybe (ObjectId, Word32)  -- ^ object and bound version
@@ -78,6 +79,7 @@ data Out = Out
   , oGlobal :: Word32
   , oBar    :: Maybe ObjectId   -- ^ the bar's wl_surface
   , oStrip  :: Maybe ObjectId   -- ^ the wl_surface of the side panel's strip
+  , oCorners :: Bool            -- ^ its hot corners exist
   }
 
 data Buffer = Buffer
@@ -137,6 +139,14 @@ data Strip = Strip
   { stSurface :: ObjectId
   , stLayer   :: ObjectId
   , stOutput  :: ObjectId
+  }
+
+-- | A 1x1 invisible surface in a corner of an output (a hot corner).
+data HotCorner = HotCorner
+  { hcSurface :: ObjectId
+  , hcLayer   :: ObjectId
+  , hcOutput  :: ObjectId
+  , hcCorner  :: Corner
   }
 
 -- | The side panel, while it is out (or sliding in or away).
@@ -209,6 +219,8 @@ data S = S
   , sTip       :: Maybe Tip
   , sGrid      :: Maybe GridPop
   , sStrips    :: M.Map ObjectId Strip    -- ^ by wl_surface
+  , sCorners   :: M.Map ObjectId HotCorner  -- ^ by wl_surface
+  , sCornerGen :: Int                     -- ^ bumped when the pointer enters or leaves a surface
   , sPanel     :: Maybe Panel
   , sPanelGen  :: Int                     -- ^ bumped when the pointer enters or leaves a surface
   , sSeats     :: M.Map ObjectId Seat
@@ -259,7 +271,7 @@ runBar cfg = do
   st <- newIORef S
     { sGlobals = Globals Nothing Nothing Nothing Nothing Nothing Nothing Nothing
     , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing, sGrid = Nothing
-    , sStrips = M.empty, sPanel = Nothing, sPanelGen = 0
+    , sStrips = M.empty, sCorners = M.empty, sCornerGen = 0, sPanel = Nothing, sPanelGen = 0
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
   tickers <- newIORef M.empty
   let env = Env conn reg cfg h ws pws st sync push tickers
@@ -328,6 +340,7 @@ handle env = \case
   MsgTick -> pure False
   MsgPanelOpen gen -> panelOpen env gen >> pure False
   MsgPanelHide gen -> panelHide env gen >> pure False
+  MsgCorner gen surf -> cornerFire env gen surf >> pure False
   MsgEvent ev -> event env ev >> pure False
 
 event :: Env -> Event -> IO ()
@@ -408,6 +421,9 @@ event env ev = case ev of
     forM_ (find ((== ls) . stLayer) (M.elems (sStrips s))) $ \t -> case lse of
       ZwlrLayerSurfaceV1Closed -> destroyStrip env t
       _ -> configure (stSurface t) lse
+    forM_ (find ((== ls) . hcLayer) (M.elems (sCorners s))) $ \hc -> case lse of
+      ZwlrLayerSurfaceV1Closed -> destroyCorner env hc
+      _ -> configure (hcSurface hc) lse
     forM_ (sPanel s) $ \pl -> when (plLayer pl == ls) $ case lse of
       ZwlrLayerSurfaceV1Closed -> closePanel env
       _ -> configure (plSurface pl) lse
@@ -460,7 +476,7 @@ global env name iface ver = do
     "xdg_wm_base" -> bind 2 >>= \o -> setG (\g -> g { gWmBase = Just o })
     "wl_output" -> do
       o <- bind 4
-      modifyIORef' st $ \s -> s { sOutputs = M.insert o (Out Nothing 1 False name Nothing Nothing) (sOutputs s) }
+      modifyIORef' st $ \s -> s { sOutputs = M.insert o (Out Nothing 1 False name Nothing Nothing False) (sOutputs s) }
     "wl_seat" -> do
       o <- bind 7
       modifyIORef' st $ \s -> s { sSeats = M.insert o (Seat Nothing Nothing Nothing 0 0 0) (sSeats s) }
@@ -531,9 +547,10 @@ redrawDirty env = do
         pure (hs, hr, ts, f)
       forM_ res $ \(hs, hr, ts, f) -> modifyIORef' (eState env) $ \s' -> s'
         { sBars = M.adjust (\b' -> b' { bHits = hs, bHoverRects = hr, bTips = ts, bFrame = maybe (bFrame b') Just f }) surf (sBars s') }
-  -- the strips of the side panel: nothing to see
-  forM_ (M.elems (sStrips s)) $ \t -> forM_ (M.lookup (stSurface t) (sSurfs s)) $ \sf ->
-    when (sfDirty sf && sfConfigured sf) $ void $ present env sf $ \cv -> clear cv (Color 0 0 0 0)
+  -- the strips of the side panel and the hot corners: nothing to see
+  forM_ (map stSurface (M.elems (sStrips s)) ++ map hcSurface (M.elems (sCorners s))) $ \surf ->
+    forM_ (M.lookup surf (sSurfs s)) $ \sf ->
+      when (sfDirty sf && sfConfigured sf) $ void $ present env sf $ \cv -> clear cv (Color 0 0 0 0)
   -- the bars know what is under the pointer now
   syncTip env
   syncPanel env
@@ -638,6 +655,7 @@ createBars env = do
     forM_ (M.toList (sOutputs s)) $ \(o, out) -> when (oDone out && wanted (oName out)) $ do
       when (isNothing (oBar out)) $ createBar env o out
       forM_ (sidePanel (eCfg env)) $ \sp -> when (isNothing (oStrip out)) $ createStrip env sp o
+      when (not (oCorners out) && not (null (hotCorners (eCfg env)))) $ createCorners env o
   where
     wanted n = null (outputs (eCfg env)) || maybe False (`elem` outputs (eCfg env)) n
 
@@ -1529,11 +1547,73 @@ destroyStrip env t = do
     { sStrips = M.delete (stSurface t) (sStrips s)
     , sOutputs = M.adjust (\x -> x { oStrip = Nothing }) (stOutput t) (sOutputs s) }
 
+------------------------------------------------------------------------------
+-- Hot corners
+
+-- | A 1x1 transparent surface in each configured corner of an output. It
+-- sits on top of everything in the bar's layer and only takes the pointer.
+createCorners :: Env -> ObjectId -> IO ()
+createCorners env o = do
+  g <- sGlobals <$> readIORef st
+  forM_ (gLayerShell g) $ \(shell, _) -> forM_ (nubCorners (map fst (hotCorners cfg))) $ \corner -> do
+    msf <- newSurf env o
+    forM_ msf $ \sf -> do
+      let surf = sfSurface sf
+          (v, h) = case corner of
+            TopLeftCorner -> (zwlrLayerSurfaceV1AnchorTop, zwlrLayerSurfaceV1AnchorLeft)
+            TopRightCorner -> (zwlrLayerSurfaceV1AnchorTop, zwlrLayerSurfaceV1AnchorRight)
+            BottomLeftCorner -> (zwlrLayerSurfaceV1AnchorBottom, zwlrLayerSurfaceV1AnchorLeft)
+            BottomRightCorner -> (zwlrLayerSurfaceV1AnchorBottom, zwlrLayerSurfaceV1AnchorRight)
+      ls <- zwlrLayerShellV1GetLayerSurface c shell surf o zwlrLayerShellV1LayerOverlay (encodeUtf8 (namespace cfg ++ "-corner"))
+      zwlrLayerSurfaceV1SetSize c ls 1 1
+      zwlrLayerSurfaceV1SetAnchor c ls (v .|. h)
+      -- in the very corner, ignoring the bar's exclusive zone
+      zwlrLayerSurfaceV1SetExclusiveZone c ls (-1)
+      wlSurfaceCommit c surf
+      modifyIORef' st $ \s -> s
+        { sSurfs = M.insert surf sf { sfW = 1, sfH = 1 } (sSurfs s)
+        , sCorners = M.insert surf (HotCorner surf ls o corner) (sCorners s) }
+  modifyIORef' st $ \s -> s { sOutputs = M.adjust (\x -> x { oCorners = True }) o (sOutputs s) }
+  where
+    c = eConn env
+    st = eState env
+    cfg = eCfg env
+    nubCorners = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
+
+destroyCorner :: Env -> HotCorner -> IO ()
+destroyCorner env hc = do
+  zwlrLayerSurfaceV1Destroy (eConn env) (hcLayer hc)
+  destroySurf env (hcSurface hc)
+  modifyIORef' (eState env) $ \s -> s
+    { sCorners = M.delete (hcSurface hc) (sCorners s)
+    , sOutputs = M.adjust (\x -> x { oCorners = False }) (hcOutput hc) (sOutputs s) }
+
+-- | The pointer entered or left a surface: if it is now in a hot corner,
+-- run the corner's action after the delay, unless it has moved on.
+cornerPointer :: Env -> IO ()
+cornerPointer env = do
+  s <- readIORef (eState env)
+  let gen = sCornerGen s + 1
+      focused = [ f | se <- M.elems (sSeats s), Just f <- [sFocus se] ]
+  writeIORef (eState env) s { sCornerGen = gen }
+  forM_ (listToMaybe [ f | f <- focused, M.member f (sCorners s) ]) $ \surf ->
+    void $ forkIO $ threadDelay (max 0 (hotCornerDelay (eCfg env)) * 1000) >> ePush env (MsgCorner gen surf)
+
+cornerFire :: Env -> Int -> ObjectId -> IO ()
+cornerFire env gen surf = do
+  s <- readIORef (eState env)
+  let still = any ((== Just surf) . sFocus) (M.elems (sSeats s))
+  when (gen == sCornerGen s && still) $
+    forM_ (M.lookup surf (sCorners s)) $ \hc ->
+      forM_ [ act | (corner, act) <- hotCorners (eCfg env), corner == hcCorner hc ] $ \act ->
+        void $ forkIO $ void $ E.try @E.SomeException act
+
 -- | When an output goes away.
 destroyPanelOn :: Env -> ObjectId -> IO ()
 destroyPanelOn env o = do
   s <- readIORef (eState env)
   mapM_ (destroyStrip env) [ t | t <- M.elems (sStrips s), stOutput t == o ]
+  mapM_ (destroyCorner env) [ hc | hc <- M.elems (sCorners s), hcOutput hc == o ]
   forM_ (sPanel s) $ \pl -> when (plOutput pl == o) (closePanel env)
 
 -- | The pointer entered or left one of our surfaces: open the panel after
@@ -1792,10 +1872,12 @@ pointer env p pe = do
         setSeat se { sFocus = if M.member surf (sSurfs s) then Just surf else Nothing, sX = x, sY = y, sAxis = 0 }
         hover (Just surf) x y
         panelPointer env
+        cornerPointer env
       WlPointerLeave _ _ -> do
         setSeat se { sFocus = Nothing, sAxis = 0 }
         hover Nothing 0 0
         panelPointer env
+        cornerPointer env
         s' <- readIORef st
         forM_ (sPopup s') $ \pop -> do
           let gen = pAway pop + 1

@@ -7,6 +7,7 @@ module Waymobar.Core
   , defaultConfig
     -- * Side panel
   , SidePanel (..)
+  , Corner (..)
   , Edge (..)
   , defaultSidePanel
     -- * Widgets
@@ -73,7 +74,16 @@ data Config = Config
   , sidePanel     :: Maybe SidePanel
     -- ^ a hidden panel that slides out when the pointer is pushed against
     -- an edge of the screen ('Nothing' = none)
+  , hotCorners    :: [(Corner, IO ())]
+    -- ^ actions run when the pointer is pushed into a corner of the screen
+    -- and rests there 'hotCornerDelay' milliseconds (macOS's hot corners):
+    -- @[(TopLeftCorner, spawn "locklet")]@
+  , hotCornerDelay :: Int
   }
+
+-- | A corner of the screen, for 'hotCorners'.
+data Corner = TopLeftCorner | TopRightCorner | BottomLeftCorner | BottomRightCorner
+  deriving (Eq, Show)
 
 -- | A side of the screen.
 data Edge = LeftEdge | RightEdge
@@ -125,6 +135,8 @@ defaultConfig = Config
   , popoverRadius = 10
   , popoverFade = 140
   , sidePanel = Nothing
+  , hotCorners = []
+  , hotCornerDelay = 250
   }
 
 -- | An output name, such as @"DP-1"@ (empty if the compositor did not say).
