@@ -13,6 +13,7 @@ module Waymobar
   , def
   , module Waymobar.Core
   , module Waymobar.Widgets
+  , module Waymobar.Taskbar
   , module Waymobar.Tray
   , module Waymobar.Audio
   , module Waymobar.Network
@@ -25,6 +26,7 @@ module Waymobar
   , module Waymobar.Power
   , R.Action (..)
   , R.Workspace (..)
+  , R.WindowEntry (..)
   , R.RState (..)
   , R.sendAction
   ) where
@@ -34,6 +36,7 @@ import Waymobar.Config (def)
 import Waymobar.Core
 import qualified Waymobar.Rivermonad as R
 import Waymobar.Widgets
+import Waymobar.Taskbar
 import Waymobar.Tray
 import Waymobar.Audio
 import Waymobar.Network

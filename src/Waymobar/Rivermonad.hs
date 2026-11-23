@@ -4,6 +4,7 @@
 module Waymobar.Rivermonad
   ( RState (..)
   , Workspace (..)
+  , WindowEntry (..)
   , Action (..)
   , RivermonadClient
   , startClient
@@ -35,6 +36,18 @@ data RState = RState
   , rsTitle         :: Maybe String
   , rsAppId         :: Maybe String
   , rsKeyboardLayout :: Maybe String  -- ^ the active xkb layout's name
+  , rsWindows       :: [WindowEntry]  -- ^ every window (rivermonad >= 0.4.3), workspace by workspace
+  } deriving (Eq, Show)
+
+-- | A window, as rivermonad lists them for task bars.
+data WindowEntry = WindowEntry
+  { winId        :: String   -- ^ river's identifier, stable across restarts
+  , winAppId     :: String
+  , winTitle     :: String
+  , winWorkspace :: String
+  , winFocused   :: Bool
+  , winFloating  :: Bool
+  , winHidden    :: Bool     -- ^ minimised, or a scratchpad waiting
   } deriving (Eq, Show)
 
 data Workspace = Workspace
@@ -58,6 +71,9 @@ data Action
   | FocusDown
   | Restart
   | Logout                 -- ^ close every window gracefully, then end the session
+  | FocusWindowId String   -- ^ focus a window by its id (a hidden one comes here); rivermonad >= 0.4.0
+  | CloseWindowId String
+  | MoveWindowId String String  -- ^ a window by its id, to a workspace
   deriving (Eq, Show)
 
 data RivermonadClient = RivermonadClient
@@ -140,6 +156,9 @@ sendAction a = void $ forkIO $ void $ (E.try :: IO () -> IO (Either E.SomeExcept
       ViewWorkspace t -> J.obj [("ViewWorkspace", J.str t)]
       NextLayout -> J.str "NextLayout"
       JumpToLayout l -> J.obj [("JumpToLayout", J.str l)]
+      FocusWindowId i -> J.obj [("FocusWindow", J.obj [("id", J.str i)])]
+      CloseWindowId i -> J.obj [("CloseWindow", J.obj [("id", J.str i)])]
+      MoveWindowId i t -> J.obj [("MoveWindow", J.obj [("id", J.str i), ("workspace", J.str t)])]
       FocusUp -> J.str "FocusUp"
       FocusDown -> J.str "FocusDown"
       Restart -> J.str "Restart"
@@ -157,6 +176,9 @@ parseState line = do
     , rsTitle = optStr "title" st
     , rsAppId = optStr "app_id" st
     , rsKeyboardLayout = optStr "keyboard_layout" st
+    , rsWindows = case J.lookupKey "windows" st of
+        Just (J.JArr ws) -> mapMaybe window ws
+        _ -> []
     }
   where
     optStr k o = case J.lookupKey k o of
@@ -166,6 +188,17 @@ parseState line = do
     num k o = case J.lookupKey k o of
       Just (J.JNum n) -> round n
       _ -> 0
+    window o = do
+      J.JStr i <- J.lookupKey "id" o
+      pure WindowEntry
+        { winId = i
+        , winAppId = fromMaybe "" (optStr "app_id" o)
+        , winTitle = fromMaybe "" (optStr "title" o)
+        , winWorkspace = fromMaybe "" (optStr "workspace" o)
+        , winFocused = bool "focused" o
+        , winFloating = bool "floating" o
+        , winHidden = bool "hidden" o
+        }
     workspace o = do
       J.JStr name <- J.lookupKey "name" o
       pure Workspace

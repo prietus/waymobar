@@ -7,6 +7,7 @@ module Waymobar.Apps
   , LauncherConfig (..)
   , defaultLauncher
   , appLauncher
+  , appForAppId
   ) where
 
 import Control.Concurrent (forkIO)
@@ -34,6 +35,7 @@ data App = App
   , appIcon     :: String   -- ^ icon name or path (@""@ = none)
   , appExec     :: String   -- ^ command line, field codes (@%U@...) still in it
   , appTerminal :: Bool     -- ^ runs in a terminal
+  , appWmClass  :: String   -- ^ StartupWMClass: the app id its windows have, when it differs from the file's
   } deriving (Eq, Show)
 
 -- | The applications a menu should show, sorted by name: those of
@@ -112,7 +114,8 @@ parseDesktop langs desktops i txt = do
       , appName = unescape name
       , appIcon = fromMaybe "" (get "Icon")
       , appExec = exec
-      , appTerminal = true "Terminal" }
+      , appTerminal = true "Terminal"
+      , appWmClass = fromMaybe "" (get "StartupWMClass") }
     _ -> Nothing
   where
     isGroup l = "[" `isPrefixOf` l
@@ -194,3 +197,18 @@ unescape [] = []
 -- | A file as UTF-8 (what the spec asks for), whatever the locale.
 readFileStrict :: FilePath -> IO String
 readFileStrict p = T.unpack . TE.decodeUtf8Lenient <$> B.readFile p
+
+-- | The application a window belongs to, by the window's app id: the
+-- desktop file of the same name (@org.gnome.Nautilus@ for
+-- @org.gnome.Nautilus.desktop@), or the one whose @StartupWMClass@ is that
+-- app id, ignoring case.
+appForAppId :: [App] -> String -> Maybe App
+appForAppId apps aid = case [ a | a <- apps, low (stripDesktop (appId a)) == key ] of
+  a : _ -> Just a
+  [] -> case [ a | a <- apps, low (appWmClass a) == key ] of
+    a : _ -> Just a
+    [] -> Nothing
+  where
+    key = low aid
+    low = map toLower
+    stripDesktop i = let r = reverse i in if take 8 r == "potksed." then reverse (drop 8 r) else i

@@ -116,6 +116,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `commandReader cmd` | last line printed by a long-running command (markup) |
 | `tray defaultTray` | system tray (see below) |
 | `volume f` | volume of the default output, live (see below) |
+| `taskbar cfg` | the open windows with their icons; click to focus (see below) |
 | `notifications cfg` | mako's notifications: new ones, "do not disturb", the recent ones (see below) |
 | `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
@@ -283,6 +284,23 @@ hotCorners =
 Each corner is a transparent 1x1 surface above everything, so it works
 over windows too. The action runs once each time the pointer arrives; any
 `IO ()` works, e.g. `sendAction (FocusWorkspace "web")` for rivermonad.
+
+### Task bar
+
+`taskbar defaultTaskbar` shows the open windows, from rivermonad's IPC
+(rivermonad 0.4.3 or newer), each with its application's icon (from its
+desktop file, matched by the window's app id or `StartupWMClass`) and its
+title. A click focuses the window (a minimised one comes back to the
+current workspace), the middle button closes it, the right button opens a
+menu to move it to another workspace or close it.
+
+```haskell
+taskbar defaultTaskbar
+  { tbScope = ThisWorkspace          -- or AllWorkspaces
+  , tbShowHidden = True              -- minimised windows too
+  , tbLabel = escape . shorten 20 . winTitle   -- "" for icons only
+  , tbFocusedStyle = noStyle { styleBg = Just "#45475a", styleRadius = Just 8 } }
+```
 
 ### Notifications
 

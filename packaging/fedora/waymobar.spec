@@ -6,7 +6,7 @@
 %{?haskell_setup}
 
 Name:           %{pkg_name}
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Wayland status bar written and configured in Haskell
 
@@ -152,6 +152,9 @@ This package provides the Haskell %{name} profiling library.
 
 
 %changelog
+* Mon Nov 23 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.5.0-1
+- Task bar widget: the open windows with their icons (rivermonad >= 0.4.3)
+
 * Mon Nov 23 2026 Carlos Prieto Ortiz <prietus@live.com> - 0.4.0-1
 - Notifications widget for mako: new ones, do not disturb, the recent ones
 - On-screen display for volume, brightness and keyboard layout changes
