@@ -16,6 +16,7 @@ module Waymobar
   , module Waymobar.Tray
   , module Waymobar.Audio
   , module Waymobar.Network
+  , module Waymobar.Notifications
   , module Waymobar.Media
   , module Waymobar.Weather
   , module Waymobar.GeoClue
@@ -36,6 +37,7 @@ import Waymobar.Widgets
 import Waymobar.Tray
 import Waymobar.Audio
 import Waymobar.Network
+import Waymobar.Notifications
 import Waymobar.Media
 import Waymobar.Weather
 import Waymobar.GeoClue

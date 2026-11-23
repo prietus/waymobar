@@ -97,6 +97,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `namespace` | `"waymobar"` | layer-shell namespace |
 | `sidePanel` | `Nothing` | a panel hidden at an edge of the screen (see below) |
 | `hotCorners` | `[]` | actions for the corners of the screen (see below) |
+| `osd` | `Nothing` | an on-screen display for volume, brightness and keyboard layout (see below) |
 | `hotCornerDelay` | `250` | milliseconds the pointer rests in a corner before its action runs |
 
 ### Widgets
@@ -115,6 +116,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `commandReader cmd` | last line printed by a long-running command (markup) |
 | `tray defaultTray` | system tray (see below) |
 | `volume f` | volume of the default output, live (see below) |
+| `notifications cfg` | mako's notifications: new ones, "do not disturb", the recent ones (see below) |
 | `network secs f`, `networkHover secs f g`, `wifiMenu w` | connection, Wi-Fi network and signal, IP, traffic; Wi-Fi menu |
 | `mpris f` | the current media player (see below) |
 | `weather cfg f` | the current weather, from Open-Meteo (see below) |
@@ -281,6 +283,49 @@ hotCorners =
 Each corner is a transparent 1x1 surface above everything, so it works
 over windows too. The action runs once each time the pointer arrives; any
 `IO ()` works, e.g. `sendAction (FocusWorkspace "web")` for rivermonad.
+
+### Notifications
+
+`notifications defaultNotifications` follows mako through `makoctl`: a
+bell with how many notifications arrived since you last looked (crossed
+out in "do not disturb"). A click lists the recent ones, with "Do Not
+Disturb", "Show the Last One Again" and "Dismiss All"; the right button
+switches "do not disturb" at once; with the pointer on it, a popover lists
+the recent ones.
+
+```haskell
+notifications defaultNotifications
+  { notifLabel = \st -> (if nsDnd st then "🔕" else "🔔")
+                         ++ (if nsUnseen st > 0 then " " ++ show (nsUnseen st) else "") }
+```
+
+"Do not disturb" is mako's mode `do-not-disturb`; mako's config has to hide
+notifications in it (they still go to the history):
+
+```ini
+[mode=do-not-disturb]
+invisible=1
+```
+
+### On-screen display
+
+`osd = Just defaultOsd` shows a box at the bottom of the focused screen for
+a moment when the volume, the backlight brightness or rivermonad's
+keyboard layout changes, with a level bar for the first two. Nothing has
+to call it: waymobar notices the changes itself (the volume through
+PulseAudio/PipeWire, the brightness in `/sys/class/backlight`, the layout
+from rivermonad's IPC), so the keys that change them stay where they are.
+
+```haskell
+  , osd = Just defaultOsd
+      { osdBarColor = "#cba6f7"
+      , osdVolumeLabel = \muted p -> if muted then "🔇  Muted" else "🔊  " ++ show p ++ "%"
+      , osdTimeout = 1500 }
+```
+
+It takes no clicks and draws like the popovers (`popoverBg`,
+`popoverRadius`, `menuBorder`). A widget of your own can show anything in
+it with `showOsd` from its `BarEnv`: `showOsd "markup" (Just 0.5)`.
 
 ### Icons
 

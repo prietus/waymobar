@@ -33,11 +33,13 @@ import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr, nullPtr)
 import GHC.Clock (getMonotonicTime)
+import System.Directory (listDirectory)
 import System.Environment (setEnv)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 import System.Posix.Types (Fd (..))
 
+import Waymobar.Audio (Volume (..), onVolumeChange)
 import Waymobar.Core
 import Waymobar.Draw
 import Waymobar.Icons (resolveIcon)
@@ -61,6 +63,8 @@ data Msg
   | MsgPanelOpen Int                                -- ^ open the side panel if the pointer still rests at the edge
   | MsgPanelHide Int                                -- ^ close it if the pointer is still away
   | MsgCorner Int ObjectId                          -- ^ run a hot corner's action if the pointer still rests there
+  | MsgOsd String (Maybe Double)                    -- ^ show the on-screen display
+  | MsgOsdHide Int                                  -- ^ let it fade, if nothing was shown since
 
 data Globals = Globals
   { gCompositor :: Maybe (ObjectId, Word32)  -- ^ object and bound version
@@ -149,6 +153,20 @@ data HotCorner = HotCorner
   , hcCorner  :: Corner
   }
 
+-- | The on-screen display, while it shows (or fades in or away).
+data OsdPop = OsdPop
+  { oSurface :: ObjectId
+  , oLayer   :: ObjectId
+  , oOut     :: ObjectId
+  , oMarkup  :: String
+  , oValue   :: Maybe Double
+  , oFrom    :: Double             -- ^ opacity the running fade started at
+  , oTo      :: Double             -- ^ 1 (showing) or 0 (going away)
+  , oStart   :: Double
+  , oFrame   :: Maybe ObjectId
+  , oGen     :: Int                -- ^ bumped on every change, for the timer
+  }
+
 -- | The side panel, while it is out (or sliding in or away).
 data Panel = Panel
   { plSurface    :: ObjectId
@@ -221,6 +239,7 @@ data S = S
   , sStrips    :: M.Map ObjectId Strip    -- ^ by wl_surface
   , sCorners   :: M.Map ObjectId HotCorner  -- ^ by wl_surface
   , sCornerGen :: Int                     -- ^ bumped when the pointer enters or leaves a surface
+  , sOsd       :: Maybe OsdPop
   , sPanel     :: Maybe Panel
   , sPanelGen  :: Int                     -- ^ bumped when the pointer enters or leaves a surface
   , sSeats     :: M.Map ObjectId Seat
@@ -239,6 +258,7 @@ data Env = Env
   , eSync    :: ObjectId
   , ePush    :: Msg -> IO ()
   , eTickers :: IORef (M.Map String (Double, Double))  -- ^ ticker markup -> (when it appeared, when last drawn)
+  , eRiver   :: IO (Maybe R.RState)     -- ^ rivermonad's state, for the focused output
   }
 
 -- | Run the bar until the compositor goes away.
@@ -253,7 +273,9 @@ runBar cfg = do
         { redraw = push MsgRedraw
         , rivermonadState = R.currentState client
         , rivermonadDo = R.sendAction
+        , showOsd = \m v -> when (isJust (osd cfg)) (push (MsgOsd m v))
         }
+  forM_ (osd cfg) $ \oc -> startOsdSources oc client push
   ws <- (,,) <$> mapM (`startWidget` benv) (left cfg)
              <*> mapM (`startWidget` benv) (center cfg)
              <*> mapM (`startWidget` benv) (right cfg)
@@ -271,10 +293,10 @@ runBar cfg = do
   st <- newIORef S
     { sGlobals = Globals Nothing Nothing Nothing Nothing Nothing Nothing Nothing
     , sOutputs = M.empty, sSurfs = M.empty, sBars = M.empty, sPopup = Nothing, sTip = Nothing, sGrid = Nothing
-    , sStrips = M.empty, sCorners = M.empty, sCornerGen = 0, sPanel = Nothing, sPanelGen = 0
+    , sStrips = M.empty, sCorners = M.empty, sCornerGen = 0, sOsd = Nothing, sPanel = Nothing, sPanelGen = 0
     , sSeats = M.empty, sLastPress = Nothing, sReady = False }
   tickers <- newIORef M.empty
-  let env = Env conn reg cfg h ws pws st sync push tickers
+  let env = Env conn reg cfg h ws pws st sync push tickers (R.currentState client)
   let loop = do
         first <- atomically (readTQueue q)
         rest <- atomically (flushTQueue q)
@@ -341,6 +363,8 @@ handle env = \case
   MsgPanelOpen gen -> panelOpen env gen >> pure False
   MsgPanelHide gen -> panelHide env gen >> pure False
   MsgCorner gen surf -> cornerFire env gen surf >> pure False
+  MsgOsd m v -> osdShow env m v >> pure False
+  MsgOsdHide gen -> osdHide env gen >> pure False
   MsgEvent ev -> event env ev >> pure False
 
 event :: Env -> Event -> IO ()
@@ -384,6 +408,10 @@ event env ev = case ev of
     forM_ [ b | b <- M.elems bars, bFrame b == Just cb ] $ \b -> do
       modifyIORef' st $ \s -> s { sBars = M.adjust (\b' -> b' { bFrame = Nothing }) (bSurface b) (sBars s) }
       updSurf (bSurface b) (\sf -> sf { sfDirty = True })
+    mo <- sOsd <$> readIORef st
+    forM_ mo $ \o -> when (oFrame o == Just cb) $ do
+      modifyIORef' st $ \s -> s { sOsd = Just o { oFrame = Nothing } }
+      updSurf (oSurface o) (\sf -> sf { sfDirty = True })
     mpl <- sPanel <$> readIORef st
     forM_ mpl $ \pl -> when (plFrame pl == Just cb) $ do
       modifyIORef' st $ \s -> s { sPanel = Just pl { plFrame = Nothing } }
@@ -427,6 +455,9 @@ event env ev = case ev of
     forM_ (sPanel s) $ \pl -> when (plLayer pl == ls) $ case lse of
       ZwlrLayerSurfaceV1Closed -> closePanel env
       _ -> configure (plSurface pl) lse
+    forM_ (sOsd s) $ \o -> when (oLayer o == ls) $ case lse of
+      ZwlrLayerSurfaceV1Closed -> closeOsd env
+      _ -> configure (oSurface o) lse
   EvXdgWmBase wm (XdgWmBasePing serial) -> xdgWmBasePong c wm serial
   EvXdgSurface xs (XdgSurfaceConfigure serial) -> do
     mp <- sPopup <$> readIORef st
@@ -554,6 +585,9 @@ redrawDirty env = do
   -- the bars know what is under the pointer now
   syncTip env
   syncPanel env
+  -- closing frees a surface's buffers: before reading the state the
+  -- surfaces are drawn from, or a closed one would be drawn into freed memory
+  syncOsd env
   s' <- readIORef (eState env)
   let dirty surf = [ sf | Just sf <- [M.lookup surf (sSurfs s')], sfDirty sf, sfConfigured sf ]
   forM_ (sPopup s') $ \p -> forM_ (dirty (pSurface p)) $ \sf -> do
@@ -587,6 +621,16 @@ redrawDirty env = do
         else pure Nothing
     forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
       x { sGrid = (\g' -> g' { gpFrame = Just f }) <$> sGrid x }
+  forM_ (sOsd s') $ \o -> forM_ (dirty (oSurface o)) $ \sf -> do
+    now <- getMonotonicTime
+    let a = osdAlpha o now
+    cb <- present env sf $ \cv -> do
+      paintOsd env cv o a (fromIntegral (sfW sf)) (fromIntegral (sfH sf))
+      if a /= oTo o && isNothing (oFrame o)
+        then Just <$> wlSurfaceFrame (eConn env) (sfSurface sf)
+        else pure Nothing
+    forM_ (join cb) $ \f -> modifyIORef' (eState env) $ \x ->
+      x { sOsd = (\o' -> o' { oFrame = Just f }) <$> sOsd x }
   forM_ (sPanel s') $ \pl -> forM_ (dirty (plSurface pl)) $ \sf -> do
     now <- getMonotonicTime
     let a = panelAlpha (eCfg env) pl now
@@ -1608,12 +1652,211 @@ cornerFire env gen surf = do
       forM_ [ act | (corner, act) <- hotCorners (eCfg env), corner == hcCorner hc ] $ \act ->
         void $ forkIO $ void $ E.try @E.SomeException act
 
+------------------------------------------------------------------------------
+-- On-screen display
+
+osdPad, osdBarH, osdGap :: Double
+osdPad = 16      -- inside the box
+osdBarH = 6      -- the level bar
+osdGap = 10      -- between the label and the bar
+
+-- | Follow what the OSD shows: the volume, the backlight and rivermonad's
+-- keyboard layout. Only changes are shown, not the values at start-up.
+startOsdSources :: OsdConfig -> R.RivermonadClient -> (Msg -> IO ()) -> IO ()
+startOsdSources oc client push = do
+  when (osdVolume oc) $ do
+    prev <- newIORef Nothing
+    onVolumeChange $ \mv -> forM_ mv $ \v -> do
+      old <- atomicModifyIORef' prev (\p -> (Just v, p))
+      forM_ old $ \o -> when (o /= v) $
+        push (MsgOsd (osdVolumeLabel oc (volMuted v) (volPercent v))
+                     (Just (if volMuted v then 0 else min 1 (fromIntegral (volPercent v) / 100))))
+  when (osdBrightness oc) $ void $ forkIO $ do
+    dirs <- E.try (listDirectory "/sys/class/backlight") :: IO (Either E.SomeException [FilePath])
+    case dirs of
+      Right (d : _) -> do
+        let base = "/sys/class/backlight/" ++ d ++ "/"
+            readInt f = do
+              r <- E.try (readFile (base ++ f) >>= \t -> length t `seq` pure t)
+              pure $ case r of
+                Right t | [(n, _)] <- reads t -> Just (n :: Int)
+                Right _ -> Nothing
+                Left e -> const Nothing (e :: E.SomeException)
+            loop old = do
+              cur <- readInt "brightness"
+              mx <- readInt "max_brightness"
+              case (cur, mx) of
+                (Just c, Just m) | m > 0, Just c /= old, isJust old -> do
+                  let p = round (100 * fromIntegral c / fromIntegral m :: Double)
+                  push (MsgOsd (osdBrightnessLabel oc p) (Just (fromIntegral c / fromIntegral m)))
+                _ -> pure ()
+              threadDelay 250000
+              loop (maybe old Just cur)
+        start <- readInt "brightness"
+        loop start
+      _ -> pure ()   -- no backlight (a desktop monitor, a VM)
+  when (osdKeyboardLayout oc) $ void $ forkIO $ do
+    let layoutNow = (>>= R.rsKeyboardLayout) <$> R.currentState client
+        loop old = do
+          threadDelay 300000
+          cur <- layoutNow
+          case (old, cur) of
+            (Just o, Just c) | o /= c -> push (MsgOsd (osdLayoutLabel oc c) Nothing)
+            _ -> pure ()
+          loop (maybe old Just cur)
+    layoutNow >>= loop
+
+-- | How visible the OSD is now, eased: it fades in quickly and out a bit
+-- slower.
+osdAlpha :: OsdPop -> Double -> Double
+osdAlpha o now = oFrom o + (oTo o - oFrom o) * (1 - (1 - p) ^ (3 :: Int))
+  where
+    d = osdDuration o
+    p = if d <= 0 then 1 else max 0 (min 1 ((now - oStart o) / d))
+
+osdDuration :: OsdPop -> Double
+osdDuration o = if oTo o == 0 then 0.25 else 0.12
+
+-- | Show (or update) the OSD on the focused screen and restart its timer.
+osdShow :: Env -> String -> Maybe Double -> IO ()
+osdShow env markup value = forM_ (osd (eCfg env)) $ \oc -> do
+  s <- readIORef st
+  now <- getMonotonicTime
+  target <- osdOutput env
+  case (sOsd s, target) of
+    (Just o, Just t) | oOut o == t -> do
+      let a = osdAlpha o now
+          o' = o { oMarkup = markup, oValue = value, oGen = oGen o + 1
+                 , oFrom = if oTo o == 1 then oFrom o else a
+                 , oTo = 1, oStart = if oTo o == 1 then oStart o else now }
+      modifyIORef' st $ \x -> x { sOsd = Just o'
+                               , sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (oSurface o) (sSurfs x) }
+      later oc (oGen o')
+    (_, Just t) -> do
+      closeOsd env
+      gen <- maybe 0 ((+ 1) . oGen) . sOsd <$> readIORef st
+      openOsd env oc t markup value gen
+      later oc gen
+    _ -> pure ()
+  where
+    st = eState env
+    later oc gen = void $ forkIO $ threadDelay (osdTimeout oc * 1000) >> ePush env (MsgOsdHide gen)
+
+-- | The output to show it on: rivermonad's focused one, else the first.
+osdOutput :: Env -> IO (Maybe ObjectId)
+osdOutput env = do
+  s <- readIORef (eState env)
+  rs <- eRiver env
+  let outs = [ (o, out) | (o, out) <- M.toList (sOutputs s), oDone out ]
+      focused = do
+        name <- rs >>= R.rsFocusedOutput
+        listToMaybe [ o | (o, out) <- outs, oName out == Just name ]
+  pure $ case focused of
+    Just o -> Just o
+    Nothing -> fst <$> listToMaybe outs
+
+openOsd :: Env -> OsdConfig -> ObjectId -> String -> Maybe Double -> Int -> IO ()
+openOsd env oc o markup value gen = do
+  s <- readIORef st
+  case (gLayerShell (sGlobals s), gCompositor (sGlobals s)) of
+    (Just (shell, _), Just (comp, _)) -> do
+      th <- fontHeight (font cfg)
+      msf <- newSurf env o
+      forM_ msf $ \sf -> do
+        let surf = sfSurface sf
+            mg = tipMargin
+            w = osdWidth oc + 2 * mg
+            h = round (2 * osdPad + fromIntegral th + osdGap + osdBarH) + 2 * mg
+        ls <- zwlrLayerShellV1GetLayerSurface c shell surf o zwlrLayerShellV1LayerOverlay (encodeUtf8 (namespace cfg ++ "-osd"))
+        zwlrLayerSurfaceV1SetSize c ls (fromIntegral w) (fromIntegral h)
+        zwlrLayerSurfaceV1SetAnchor c ls zwlrLayerSurfaceV1AnchorBottom
+        zwlrLayerSurfaceV1SetMargin c ls 0 0 (fromIntegral (max 0 (osdBottom oc - mg))) 0
+        zwlrLayerSurfaceV1SetExclusiveZone c ls (-1)
+        -- it takes no clicks: an empty input region
+        region <- wlCompositorCreateRegion c comp
+        wlSurfaceSetInputRegion c surf region
+        wlRegionDestroy c region
+        wlSurfaceCommit c surf
+        now <- getMonotonicTime
+        modifyIORef' st $ \x -> x
+          { sSurfs = M.insert surf sf { sfW = w, sfH = h } (sSurfs x)
+          , sOsd = Just OsdPop
+              { oSurface = surf, oLayer = ls, oOut = o, oMarkup = markup, oValue = value
+              , oFrom = 0, oTo = 1, oStart = now, oFrame = Nothing, oGen = gen } }
+    _ -> pure ()
+  where
+    c = eConn env
+    st = eState env
+    cfg = eCfg env
+
+-- | Start fading away, if nothing was shown since the timer started.
+osdHide :: Env -> Int -> IO ()
+osdHide env gen = do
+  s <- readIORef (eState env)
+  forM_ (sOsd s) $ \o -> when (oGen o == gen && oTo o == 1) $ do
+    now <- getMonotonicTime
+    let o' = o { oFrom = osdAlpha o now, oTo = 0, oStart = now }
+    modifyIORef' (eState env) $ \x -> x { sOsd = Just o'
+                                       , sSurfs = M.adjust (\sf -> sf { sfDirty = True }) (oSurface o) (sSurfs x) }
+    -- frame callbacks stop once it is invisible: make sure it goes
+    void $ forkIO $ threadDelay (round (osdDuration o' * 1000000) + 20000) >> ePush env MsgTick
+
+-- | Close the OSD once it has faded away.
+syncOsd :: Env -> IO ()
+syncOsd env = do
+  s <- readIORef (eState env)
+  now <- getMonotonicTime
+  forM_ (sOsd s) $ \o -> when (oTo o == 0 && now - oStart o >= osdDuration o) (closeOsd env)
+
+closeOsd :: Env -> IO ()
+closeOsd env = do
+  s <- readIORef (eState env)
+  forM_ (sOsd s) $ \o -> do
+    zwlrLayerSurfaceV1Destroy (eConn env) (oLayer o)
+    destroySurf env (oSurface o)
+    modifyIORef' (eState env) $ \x -> x { sOsd = Nothing }
+
+-- | The box (like a popover), the label and the level bar; it rises a few
+-- pixels as it fades in.
+paintOsd :: Env -> Canvas -> OsdPop -> Double -> Double -> Double -> IO ()
+paintOsd env cv o alpha w h = do
+  let cfg = eCfg env
+      mg = fromIntegral tipMargin
+      bw = w - 2 * mg
+      bh = h - 2 * mg
+      barColor = maybe "#cba6f7" osdBarColor (osd cfg)
+  clear cv (Color 0 0 0 0)
+  withFadeXY cv alpha 0 (8 * (1 - alpha)) $ do
+    drawPanel cfg cv mg mg bw bh
+    setColor cv (color (fgColor cfg))
+    withFont (font cfg) $ \fnt -> withMarkup cv fnt (oMarkup o) $ \l -> do
+      ellipsizeLayout l (bw - 2 * osdPad)
+      (tw, _) <- layoutSize l
+      -- centred when there is no level bar
+      let tx = case oValue o of
+            Nothing -> mg + (bw - fromIntegral tw) / 2
+            Just _ -> mg + osdPad
+          ty = case oValue o of
+            Nothing -> mg + (bh - osdBarH - osdGap) / 2 - 2 + (osdBarH + osdGap) / 2 - osdPad / 2
+            Just _ -> mg + osdPad
+      showLayout cv l tx ty
+    forM_ (oValue o) $ \v -> do
+      let bx = mg + osdPad
+          by = mg + bh - osdPad - osdBarH
+          full = bw - 2 * osdPad
+      setColor cv (color (menuHighlight cfg))
+      fillRounded cv bx by full osdBarH (osdBarH / 2)
+      when (v > 0) $ do
+        setColor cv (color barColor)
+        fillRounded cv bx by (max osdBarH (full * max 0 (min 1 v))) osdBarH (osdBarH / 2)
+
 -- | When an output goes away.
 destroyPanelOn :: Env -> ObjectId -> IO ()
 destroyPanelOn env o = do
   s <- readIORef (eState env)
   mapM_ (destroyStrip env) [ t | t <- M.elems (sStrips s), stOutput t == o ]
   mapM_ (destroyCorner env) [ hc | hc <- M.elems (sCorners s), hcOutput hc == o ]
+  forM_ (sOsd s) $ \x -> when (oOut x == o) (closeOsd env)
   forM_ (sPanel s) $ \pl -> when (plOutput pl == o) (closePanel env)
 
 -- | The pointer entered or left one of our surfaces: open the panel after

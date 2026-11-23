@@ -11,6 +11,7 @@ module Waymobar.Audio
   , toggleMute
   , changeVolume
   , currentVolume
+  , onVolumeChange
   ) where
 
 import Control.Concurrent (forkIO, threadDelay, threadWaitRead)
@@ -176,3 +177,8 @@ changeVolume delta cap = do
     if delta >= 0
       then "wpctl set-volume -l " ++ show (fromIntegral cap / 100 :: Double) ++ " @DEFAULT_AUDIO_SINK@ " ++ show delta ++ "%+"
       else "wpctl set-volume @DEFAULT_AUDIO_SINK@ " ++ show (negate delta) ++ "%-"
+
+-- | Run an action every time the volume of the default output changes
+-- (starting to follow it if no volume widget did).
+onVolumeChange :: (Maybe Volume -> IO ()) -> IO ()
+onVolumeChange l = addListener l >> ensureStarted

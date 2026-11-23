@@ -8,6 +8,8 @@ module Waymobar.Core
     -- * Side panel
   , SidePanel (..)
   , Corner (..)
+  , OsdConfig (..)
+  , defaultOsd
   , Edge (..)
   , defaultSidePanel
     -- * Widgets
@@ -79,6 +81,41 @@ data Config = Config
     -- and rests there 'hotCornerDelay' milliseconds (macOS's hot corners):
     -- @[(TopLeftCorner, spawn "locklet")]@
   , hotCornerDelay :: Int
+  , osd           :: Maybe OsdConfig
+    -- ^ an on-screen display: a box at the bottom of the screen that shows
+    -- the volume, the brightness or the keyboard layout for a moment when
+    -- they change ('Nothing' = none)
+  }
+
+-- | The on-screen display. Labels are Pango markup (an icon and a word,
+-- say); the bar under them shows the level.
+data OsdConfig = OsdConfig
+  { osdVolume          :: Bool   -- ^ when the default output's volume changes (or it is muted)
+  , osdBrightness      :: Bool   -- ^ when the backlight in /sys/class/backlight changes
+  , osdKeyboardLayout  :: Bool   -- ^ when rivermonad switches keyboard layout
+  , osdTimeout         :: Int    -- ^ milliseconds it stays after the last change
+  , osdWidth           :: Int    -- ^ logical pixels
+  , osdBottom          :: Int    -- ^ distance from the bottom of the screen
+  , osdBarColor        :: String -- ^ the filled part of the level bar
+  , osdVolumeLabel     :: Bool -> Int -> String  -- ^ muted, percent
+  , osdBrightnessLabel :: Int -> String          -- ^ percent
+  , osdLayoutLabel     :: String -> String       -- ^ the layout's name
+  }
+
+-- | Volume, brightness and keyboard layout, 1.2 s, 260 px wide, 80 px
+-- above the bottom edge.
+defaultOsd :: OsdConfig
+defaultOsd = OsdConfig
+  { osdVolume = True
+  , osdBrightness = True
+  , osdKeyboardLayout = True
+  , osdTimeout = 1200
+  , osdWidth = 260
+  , osdBottom = 80
+  , osdBarColor = "#cba6f7"
+  , osdVolumeLabel = \muted p -> if muted then "🔇  Muted" else (if p < 50 then "🔉" else "🔊") ++ "  Volume  " ++ show p ++ "%"
+  , osdBrightnessLabel = \p -> "☀️  Brightness  " ++ show p ++ "%"
+  , osdLayoutLabel = \l -> "⌨️  " ++ l
   }
 
 -- | A corner of the screen, for 'hotCorners'.
@@ -137,6 +174,7 @@ defaultConfig = Config
   , sidePanel = Nothing
   , hotCorners = []
   , hotCornerDelay = 250
+  , osd = Nothing
   }
 
 -- | An output name, such as @"DP-1"@ (empty if the compositor did not say).
@@ -276,6 +314,9 @@ data BarEnv = BarEnv
   { redraw          :: IO ()                  -- ^ ask every bar to redraw
   , rivermonadState :: IO (Maybe RState)      -- ^ 'Nothing' if rivermonad isn't reachable
   , rivermonadDo    :: Action -> IO ()
+  , showOsd         :: String -> Maybe Double -> IO ()
+    -- ^ show markup (and a level from 0 to 1) in the on-screen display, if
+    -- 'osd' is on: a widget of your own can use it for anything
   }
 
 -- | A widget is started once, when the bar starts (it may fork threads

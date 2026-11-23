@@ -34,6 +34,7 @@ data RState = RState
   , rsFocusedOutput :: Maybe String
   , rsTitle         :: Maybe String
   , rsAppId         :: Maybe String
+  , rsKeyboardLayout :: Maybe String  -- ^ the active xkb layout's name
   } deriving (Eq, Show)
 
 data Workspace = Workspace
@@ -155,6 +156,7 @@ parseState line = do
     , rsFocusedOutput = optStr "focused_output" st
     , rsTitle = optStr "title" st
     , rsAppId = optStr "app_id" st
+    , rsKeyboardLayout = optStr "keyboard_layout" st
     }
   where
     optStr k o = case J.lookupKey k o of
