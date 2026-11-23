@@ -19,8 +19,7 @@ optdepends=('rivermonad: workspaces, layout and window title widgets'
             'power-profiles-daemon: the power profile widget'
             'mako: the notifications widget (makoctl)')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-# Filled in once v0.4.0 is tagged: sha256sum of the GitHub tarball.
-sha256sums=('SKIP')
+sha256sums=('91e47785539d4539c1b5542fe4838778c5c0334b0c8ccc16404ff6ddcec7ede1')
 
 build() {
   cd $pkgname-$pkgver
