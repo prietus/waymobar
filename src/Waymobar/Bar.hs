@@ -1548,6 +1548,9 @@ scrollGrid env n = do
 panelEdgeOf :: Config -> Edge
 panelEdgeOf = maybe RightEdge panelEdge . sidePanel
 
+panelAttachedOf :: Config -> Bool
+panelAttachedOf = maybe False panelAttached . sidePanel
+
 panelGap, panelPadY, stripW :: Double
 panelGap = 6       -- between the panel and the edge of the screen
 panelPadY = 5      -- above the first row and below the last
@@ -1993,9 +1996,11 @@ openPanel env o = do
         let surf = sfSurface sf
             mg = fromIntegral tipMargin
             right = panelEdgeOf cfg == RightEdge
-            w = ceiling (pw + mg + panelGap) :: Int
+            -- attached, it touches the edge; floating, it keeps a gap
+            gap = if panelAttachedOf cfg then 0 else panelGap
+            w = ceiling (pw + mg + gap) :: Int
             h = ceiling (ph + 2 * mg) :: Int
-            px = if right then mg else panelGap
+            px = if right then mg else gap
             -- the scale of the strip is the best guess until the compositor says
             stripSf = listToMaybe [ x | t <- M.elems (sStrips s), stOutput t == o, Just x <- [M.lookup (stSurface t) (sSurfs s)] ]
         ls <- zwlrLayerShellV1GetLayerSurface c shell surf o (layerOf cfg) (encodeUtf8 (namespace cfg ++ "-panel"))
@@ -2041,20 +2046,36 @@ closePanel env = do
 -- look (y ranges, where they are once it is out).
 paintPanel :: Env -> Canvas -> Panel -> Double -> Double -> Double
            -> IO ([(Double, Double, Click -> IO ())], [(Double, Double)], [(Double, Double, String)])
-paintPanel env cv pl alpha _ h = do
+paintPanel env cv pl alpha w h = do
   let cfg = eCfg env
       mg = fromIntegral tipMargin
       (px, px1) = plBox pl
       pw = px1 - px
       right = panelEdgeOf cfg == RightEdge
-      travel = (pw + panelGap) * (1 - alpha) * (if right then 1 else -1)
+      attached = panelAttachedOf cfg
+      away = if right then 1 else -1
+      travel = (pw + (if attached then 0 else panelGap)) * (1 - alpha) * away
+      -- attached: a tab that grows out of the edge, its contents coming
+      -- out with it; floating: the panel of a menu, sliding in as it fades
+      frame body
+        | attached = do
+            let edgeX = if right then w else 0
+                depth = pw * alpha
+                r = min (popoverRadius cfg) mg
+            setColor cv (color (fromMaybe (bgColor cfg) (popoverBg cfg)))
+            fillEdgeTab cv edgeX (negate away) depth mg (h - mg) r
+            x <- withEdgeTabClip cv edgeX (negate away) depth mg (h - mg) r (withTranslate cv travel 0 body)
+            setColor cv (color (menuBorder cfg))
+            strokeEdgeTab cv edgeX (negate away) depth mg (h - mg) r 1
+            pure x
+        | otherwise = withFadeXY cv (min 1 (alpha * 1.4)) travel 0 $
+            drawPanel cfg cv px mg pw (h - 2 * mg) >> body
       rx = px + menuBorderW + menuInset
       rw = pw - 2 * (menuBorderW + menuInset)
   blocks <- panelBlocks env (plOutputName pl)
   devScale <- canvasScale cv
   clear cv (Color 0 0 0 0)
-  withFadeXY cv (min 1 (alpha * 1.4)) travel 0 $ do
-    drawPanel cfg cv px mg pw (h - 2 * mg)
+  frame $
     withFont (font cfg) $ \fnt -> withLayouts cv fnt (map blockMarkup blocks) $ \lays -> do
       sizes <- mapM layoutSize lays
       let heights = [ snd (rowSize env b sz) | (b, sz) <- zip blocks sizes ]

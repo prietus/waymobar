@@ -10,6 +10,9 @@ module Waymobar.Draw
   , fillRounded
   , strokeRounded
   , fillRoundedReplace
+  , fillEdgeTab
+  , strokeEdgeTab
+  , withEdgeTabClip
   , withFade
   , withFadeXY
   , withTranslate
@@ -33,6 +36,7 @@ module Waymobar.Draw
   ) where
 
 import Control.Exception (bracket)
+import Control.Monad (when)
 import Data.Char (isHexDigit, digitToInt)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
@@ -92,6 +96,10 @@ foreign import ccall unsafe "cairo_close_path"
   c_close_path :: Ptr Cairo -> IO ()
 foreign import ccall unsafe "cairo_arc"
   c_arc :: Ptr Cairo -> CDouble -> CDouble -> CDouble -> CDouble -> CDouble -> IO ()
+foreign import ccall unsafe "cairo_arc_negative"
+  c_arc_negative :: Ptr Cairo -> CDouble -> CDouble -> CDouble -> CDouble -> CDouble -> IO ()
+foreign import ccall unsafe "cairo_line_to"
+  c_line_to :: Ptr Cairo -> CDouble -> CDouble -> IO ()
 foreign import ccall unsafe "cairo_set_line_width"
   c_set_line_width :: Ptr Cairo -> CDouble -> IO ()
 foreign import ccall unsafe "cairo_stroke"
@@ -325,6 +333,63 @@ roundedPath cr x y w h r0 = do
       c_arc cr (d (x + r)) (d (y + h - r)) (d r) (d (pi / 2)) (d pi)
       c_arc cr (d (x + r)) (d (y + r)) (d r) (d pi) (d (3 * pi / 2))
       c_close_path cr
+
+-- | The outline of a tab that grows out of a vertical edge of the screen:
+-- a body from @y0@ to @y1@, @depth@ wide, starting at @edgeX@ and going
+-- right (@dir = 1@) or left (@dir = -1@). Its far corners are rounded,
+-- and where it meets the edge it flares out into it with inverted
+-- corners, @r@ above and below the body, like a drop on a wall. Closed
+-- along the edge if asked.
+edgeTabPath :: Ptr Cairo -> Bool -> Double -> Double -> Double -> Double -> Double -> Double -> IO ()
+edgeTabPath cr closed edgeX dir depth y0 y1 r0 = do
+  let r = max 0 (minimum [r0, depth / 2, (y1 - y0) / 2])
+      d = realToFrac :: Double -> CDouble
+  c_save cr
+  -- drawn as if the edge were at x = 0 and the body went right
+  c_translate cr (d edgeX) 0
+  c_scale cr (d (if dir < 0 then -1 else 1)) 1
+  c_new_path cr
+  c_move_to cr 0 (d (y0 - r))
+  if r <= 0
+    then do
+      c_line_to cr 0 (d y0)
+      c_line_to cr (d depth) (d y0)
+      c_line_to cr (d depth) (d y1)
+      c_line_to cr 0 (d y1)
+    else do
+      c_arc_negative cr (d r) (d (y0 - r)) (d r) (d pi) (d (pi / 2))
+      c_arc cr (d (depth - r)) (d (y0 + r)) (d r) (d (-pi / 2)) 0
+      c_arc cr (d (depth - r)) (d (y1 - r)) (d r) 0 (d (pi / 2))
+      c_arc_negative cr (d r) (d (y1 + r)) (d r) (d (3 * pi / 2)) (d pi)
+  when closed (c_close_path cr)
+  -- the path keeps its place; only what is drawn later forgets the mirror
+  c_restore cr
+
+-- | Fill an edge tab with the current colour, replacing what is below it
+-- (alpha included), like 'fillRoundedReplace'.
+fillEdgeTab :: Canvas -> Double -> Double -> Double -> Double -> Double -> Double -> IO ()
+fillEdgeTab (Canvas cr) edgeX dir depth y0 y1 r = do
+  edgeTabPath cr True edgeX dir depth y0 y1 r
+  c_set_operator cr 1 -- CAIRO_OPERATOR_SOURCE
+  c_fill cr
+  c_set_operator cr 2 -- CAIRO_OPERATOR_OVER
+
+-- | Outline an edge tab (not along the screen's edge) with a line this wide.
+strokeEdgeTab :: Canvas -> Double -> Double -> Double -> Double -> Double -> Double -> Double -> IO ()
+strokeEdgeTab (Canvas cr) edgeX dir depth y0 y1 r lw = do
+  edgeTabPath cr False edgeX dir depth y0 y1 r
+  c_set_line_width cr (realToFrac lw)
+  c_stroke cr
+
+-- | Draw only inside an edge tab.
+withEdgeTabClip :: Canvas -> Double -> Double -> Double -> Double -> Double -> Double -> IO a -> IO a
+withEdgeTabClip (Canvas cr) edgeX dir depth y0 y1 r act = do
+  c_save cr
+  edgeTabPath cr True edgeX dir depth y0 y1 r
+  c_clip cr
+  x <- act
+  c_restore cr
+  pure x
 
 -- | Fill a rounded rectangle with the current colour.
 fillRounded :: Canvas -> Double -> Double -> Double -> Double -> Double -> IO ()

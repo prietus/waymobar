@@ -253,6 +253,7 @@ sidePanel = Just defaultSidePanel
 | `panelHideDelay` | `400` | milliseconds after the pointer leaves it before it closes |
 | `panelSlide` | `200` | milliseconds of the slide; 0 = no animation |
 | `panelRowHeight` | `0` | height of every row in logical pixels (e.g. as wide as the icons' rows, for square buttons); 0 = fit its contents |
+| `panelAttached` | `False` | joined to the edge instead of floating beside it: no gap, and where it meets the edge it flares out with inverted corners, as if it grew out of the screen's border; it comes out growing from the edge, too |
 
 Only icons, each with what it does beside it:
 

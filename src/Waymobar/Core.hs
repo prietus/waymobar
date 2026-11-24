@@ -143,12 +143,16 @@ data SidePanel = SidePanel
   , panelHideDelay :: Int   -- ^ milliseconds after the pointer leaves it before it closes
   , panelSlide     :: Int   -- ^ milliseconds it takes to slide in; 0 = no animation
   , panelRowHeight :: Int   -- ^ height of every row in logical pixels; 0 = fit its contents
+  , panelAttached  :: Bool
+    -- ^ joined to the edge instead of floating beside it: no gap, and where
+    -- it meets the edge it flares out with inverted corners, as if it grew
+    -- out of the screen's border (which is how it comes out, too)
   }
 
 -- | The right edge, opening after 150 ms and closing 400 ms after the
--- pointer leaves; no widgets yet.
+-- pointer leaves, floating beside the edge; no widgets yet.
 defaultSidePanel :: SidePanel
-defaultSidePanel = SidePanel RightEdge [] 150 400 200 0
+defaultSidePanel = SidePanel RightEdge [] 150 400 200 0 False
 
 -- | An empty bar; "Waymobar.Config" has a populated 'def'.
 defaultConfig :: Config
