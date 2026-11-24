@@ -1594,7 +1594,8 @@ destroyStrip env t = do
 ------------------------------------------------------------------------------
 -- Hot corners
 
--- | A 1x1 transparent surface in each configured corner of an output. It
+-- | A small transparent square ('hotCornerSize', 1x1 by default) in each
+-- configured corner of an output. It
 -- sits on top of everything in the bar's layer and only takes the pointer.
 createCorners :: Env -> ObjectId -> IO ()
 createCorners env o = do
@@ -1609,19 +1610,20 @@ createCorners env o = do
             BottomLeftCorner -> (zwlrLayerSurfaceV1AnchorBottom, zwlrLayerSurfaceV1AnchorLeft)
             BottomRightCorner -> (zwlrLayerSurfaceV1AnchorBottom, zwlrLayerSurfaceV1AnchorRight)
       ls <- zwlrLayerShellV1GetLayerSurface c shell surf o zwlrLayerShellV1LayerOverlay (encodeUtf8 (namespace cfg ++ "-corner"))
-      zwlrLayerSurfaceV1SetSize c ls 1 1
+      zwlrLayerSurfaceV1SetSize c ls (fromIntegral side) (fromIntegral side)
       zwlrLayerSurfaceV1SetAnchor c ls (v .|. h)
       -- in the very corner, ignoring the bar's exclusive zone
       zwlrLayerSurfaceV1SetExclusiveZone c ls (-1)
       wlSurfaceCommit c surf
       modifyIORef' st $ \s -> s
-        { sSurfs = M.insert surf sf { sfW = 1, sfH = 1 } (sSurfs s)
+        { sSurfs = M.insert surf sf { sfW = side, sfH = side } (sSurfs s)
         , sCorners = M.insert surf (HotCorner surf ls o corner) (sCorners s) }
   modifyIORef' st $ \s -> s { sOutputs = M.adjust (\x -> x { oCorners = True }) o (sOutputs s) }
   where
     c = eConn env
     st = eState env
     cfg = eCfg env
+    side = max 1 (hotCornerSize cfg)
     nubCorners = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
 
 destroyCorner :: Env -> HotCorner -> IO ()

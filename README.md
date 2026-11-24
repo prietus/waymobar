@@ -99,6 +99,7 @@ the output path as `$1` (same convention as rivermonad, e.g. to build with
 | `hotCorners` | `[]` | actions for the corners of the screen (see below) |
 | `osd` | `Nothing` | an on-screen display for volume, brightness and keyboard layout (see below) |
 | `hotCornerDelay` | `250` | milliseconds the pointer rests in a corner before its action runs |
+| `hotCornerSize` | `1` | side of the corner's square, in pixels; bigger where the pointer does not stop at the edges (a virtual machine in a window) |
 
 ### Widgets
 
@@ -281,7 +282,7 @@ hotCorners =
   ]
 ```
 
-Each corner is a transparent 1x1 surface above everything, so it works
+Each corner is a transparent square above everything (1x1, `hotCornerSize`), so it works
 over windows too. The action runs once each time the pointer arrives; any
 `IO ()` works, e.g. `sendAction (FocusWorkspace "web")` for rivermonad.
 

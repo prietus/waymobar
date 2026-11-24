@@ -81,6 +81,10 @@ data Config = Config
     -- and rests there 'hotCornerDelay' milliseconds (macOS's hot corners):
     -- @[(TopLeftCorner, spawn "locklet")]@
   , hotCornerDelay :: Int
+  , hotCornerSize :: Int
+    -- ^ side of the corner's square, in pixels. 1 is enough where the
+    -- pointer stops at the edges of the screen; make it bigger (8 or so)
+    -- where it does not, e.g. in a virtual machine shown in a window
   , osd           :: Maybe OsdConfig
     -- ^ an on-screen display: a box at the bottom of the screen that shows
     -- the volume, the brightness or the keyboard layout for a moment when
@@ -174,6 +178,7 @@ defaultConfig = Config
   , sidePanel = Nothing
   , hotCorners = []
   , hotCornerDelay = 250
+  , hotCornerSize = 1
   , osd = Nothing
   }
 
